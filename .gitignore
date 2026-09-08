@@ -168,3 +168,6 @@ cython_debug/
 # Results
 *results*
 *figures*
+
+# Plot script (name contains "results" but is source, not output)
+!plot_results.py
