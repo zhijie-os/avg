@@ -163,7 +163,8 @@ cython_debug/
 
 # Slurm files
 *.out
-*.sh
+*.err
+#*.sh
 
 # Results
 *results*
