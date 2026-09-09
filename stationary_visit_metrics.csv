@@ -1,0 +1,2 @@
+experiment,baseline,seed,segment_index,visit_index,regime_id,start_step,end_step,episodes,first_episode_return,mean_episode_return,last_20pct_return,cumulative_reward_auc
+stationary,stationary:A,0,0,0,A,0,10000000,10000,-214.39492109217505,5328.064802453113,6463.477785023124,53280648.024531126
