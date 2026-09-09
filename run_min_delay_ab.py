@@ -52,6 +52,8 @@ Usage:
     python3 run_min_delay_ab.py --shift-type wind --smoke-test
 """
 
+import dataclasses
+
 import numpy as np
 
 from incremental_rl.envs.nonstationary_half_cheetah import (
@@ -95,36 +97,77 @@ def _target_velocity_b(args):
     return args.target_velocity_b
 
 
+def min_delay_regime_spec(
+    name,
+    *,
+    as_name=None,
+    wind_force=DEFAULT_WIND_FORCE,
+    actuator_index=DEFAULT_ACTUATOR_INDEX,
+    target_velocity_a=DEFAULT_TARGET_VELOCITY_A,
+    target_velocity_b=DEFAULT_TARGET_VELOCITY_B,
+):
+    """Build the RegimeSpec for one named min-delay regime.
+
+    Recognized names: A, B_wind, B_joint, B_velocity, B_combined.  This is
+    the single source of truth for the min-delay regime definitions and is
+    shared with run_min_delay_stationary.py, so stationary pretraining
+    regimes are identical to the corresponding B regime of the A -> B
+    experiment by construction.
+
+    ``as_name`` overrides the spec's display name (this A -> B experiment
+    labels every B variant "B" so boundary logs read "A -> B").
+    """
+
+    if name == "A":
+        spec = RegimeSpec(name="A", target_velocity=target_velocity_a)
+    elif name == "B_wind":
+        spec = RegimeSpec(
+            name=name, target_velocity=target_velocity_a, wind_force_x=wind_force
+        )
+    elif name == "B_joint":
+        spec = RegimeSpec(
+            name=name,
+            target_velocity=target_velocity_a,
+            action_sign_flips=(actuator_index,),
+        )
+    elif name == "B_velocity":
+        spec = RegimeSpec(name=name, target_velocity=target_velocity_b)
+    elif name == "B_combined":
+        spec = RegimeSpec(
+            name=name,
+            target_velocity=target_velocity_b,
+            wind_force_x=wind_force,
+            action_sign_flips=(actuator_index,),
+        )
+    else:
+        raise ValueError(f"Unknown min-delay regime {name!r}")
+
+    if as_name is not None:
+        spec = dataclasses.replace(spec, name=as_name)
+    return spec
+
+
+# Min-delay regime name behind each A -> B shift type.
+_B_SHIFT_REGIME = {
+    "wind": "B_wind",
+    "actuator": "B_joint",
+    "target_velocity": "B_velocity",
+    "combined": "B_combined",
+}
+
+
 def make_schedule(args):
     """Build the A -> B schedule for the selected shift type."""
 
-    if args.shift_type == "wind":
-        regime_a = RegimeSpec(name="A", target_velocity=args.target_velocity_a)
-        regime_b = RegimeSpec(
-            name="B",
-            target_velocity=args.target_velocity_a,  # reward unchanged: only wind changes
-            wind_force_x=args.wind_force,
-        )
-    elif args.shift_type == "actuator":
-        regime_a = RegimeSpec(name="A", target_velocity=args.target_velocity_a)
-        regime_b = RegimeSpec(
-            name="B",
-            target_velocity=args.target_velocity_a,  # reward unchanged: only the flip changes
-            action_sign_flips=(args.actuator_index,),
-        )
-    elif args.shift_type == "target_velocity":
-        regime_a = RegimeSpec(name="A", target_velocity=args.target_velocity_a)
-        regime_b = RegimeSpec(name="B", target_velocity=_target_velocity_b(args))
-    elif args.shift_type == "combined":
-        regime_a = RegimeSpec(name="A", target_velocity=args.target_velocity_a)
-        regime_b = RegimeSpec(
-            name="B",
-            target_velocity=_target_velocity_b(args),
-            wind_force_x=args.wind_force,
-            action_sign_flips=(args.actuator_index,),
-        )
-    else:
-        raise ValueError(f"Unknown shift type {args.shift_type!r}")
+    regime_a = min_delay_regime_spec("A", target_velocity_a=args.target_velocity_a)
+    regime_b = min_delay_regime_spec(
+        _B_SHIFT_REGIME[args.shift_type],
+        as_name="B",
+        wind_force=args.wind_force,
+        actuator_index=args.actuator_index,
+        target_velocity_a=args.target_velocity_a,
+        target_velocity_b=_target_velocity_b(args),
+    )
 
     return (
         schedule_from_steps(
