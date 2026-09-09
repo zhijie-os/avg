@@ -845,6 +845,7 @@ def run(args: argparse.Namespace) -> Path:
                     }
                 )
 
+            episode_return_log_value = 0
             if episode_end:
                 episodes.append(
                     {
@@ -863,6 +864,7 @@ def run(args: argparse.Namespace) -> Path:
                 )
                 episode_index += 1
                 episode_start_step = step + 1
+                episode_return_log_value = episode_return
                 episode_return = 0.0
                 episode_length = 0
                 episode_crossed_context = False
@@ -882,7 +884,7 @@ def run(args: argparse.Namespace) -> Path:
                 print(
                     f"step={completed_steps}/{total_steps} "
                     f"regime={regime.name} episodes={episode_index} "
-                    f"return={episode_return:.2f}",
+                    f"return={episode_return_log_value:.2f}",
                     flush=True,
                 )
 
