@@ -349,6 +349,7 @@ def prepare_output_dir(path: Path) -> None:
             "episodes.csv",
             "steps.npz",
             "final.pt",
+            "model.pt",
         )
         if (path / name).exists()
     ]
@@ -549,6 +550,40 @@ def persist_logs(
         output_dir / "steps.npz",
         **{name: values[:completed_steps] for name, values in step_arrays.items()},
     )
+
+
+def save_model_checkpoint(
+    output_dir: Path, manager: LearnerManager, completed_steps: int
+) -> Path:
+    """Export the trained AVG learner(s) to ``<output_dir>/model.pt``.
+
+    The saved agent states are directly reloadable with
+    ``AVGAgent.load_state_dict``; each entry also carries the observation
+    normalizer required to feed the model.  ``oracle_mixture`` exports every
+    regime learner, keyed by regime name.
+    """
+
+    checkpoint = {
+        "format": "avg_model_v1",
+        "completed_steps": completed_steps,
+        "baseline": manager.baseline,
+    }
+    if manager.baseline == "oracle_mixture":
+        checkpoint["models"] = {
+            key: {
+                "agent": bundle.agent.state_dict(),
+                "normalizer": bundle.normalizer.state_dict(),
+            }
+            for key, bundle in manager.bundles.items()
+        }
+    else:
+        checkpoint["model"] = {
+            "agent": manager.current.agent.state_dict(),
+            "normalizer": manager.current.normalizer.state_dict(),
+        }
+    path = output_dir / "model.pt"
+    torch.save(checkpoint, path)
+    return path
 
 
 def run(args: argparse.Namespace) -> Path:
@@ -933,6 +968,11 @@ def run(args: argparse.Namespace) -> Path:
             },
             args.output_dir / "final.pt",
         )
+        if args.save_model:
+            model_path = save_model_checkpoint(
+                args.output_dir, manager, completed_steps
+            )
+            print(f"Saved AVG model to {model_path}", flush=True)
         metadata.update(
             {
                 "status": "completed",
@@ -998,6 +1038,12 @@ def build_parser(description: str = __doc__) -> argparse.ArgumentParser:
     )
     parser.add_argument("--device", default="cpu")
     parser.add_argument("--experiment-name", type=str, default=None)
+    parser.add_argument(
+        "--save-model",
+        action="store_true",
+        default=False,
+        help="Save the trained AVG model(s) to <output_dir>/model.pt",
+    )
 
     # AVG hyperparameters (the official HalfCheetah configuration).
     parser.add_argument("--actor-lr", type=float, default=0.0063)
