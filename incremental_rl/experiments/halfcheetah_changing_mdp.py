@@ -761,6 +761,11 @@ def run(args: argparse.Namespace) -> Path:
                     f"at step {step}",
                     flush=True,
                 )
+                print(
+                    f"SWITCH: regime {previous.name} -> regime "
+                    f"{position.regime.name} at step {step}",
+                    flush=True,
+                )
                 for line in intervention_lines:
                     print(f"    {line}", flush=True)
                 switches.append(
