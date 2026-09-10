@@ -186,6 +186,18 @@ def main(args):
     env = NormalizeObservation(env)
     env = ClipAction(env)
 
+    # Joint malfunction from step 0
+    base_env = env.unwrapped
+    malfunction_actuator = 0
+
+    original_gear = base_env.model.actuator_gear[
+        malfunction_actuator, 0
+    ].copy()
+
+    base_env.model.actuator_gear[
+        malfunction_actuator, 0
+    ] = -original_gear
+
     #### Reproducibility
     env.reset(seed=args.seed)
     env.action_space.seed(args.seed)
@@ -301,6 +313,6 @@ if __name__ == "__main__":
 
     ### Saving data
     os.makedirs(args.results_dir, exist_ok=True)
-    pkl_fpath = os.path.join(args.results_dir, "./{}_avg_default_seed-{}.pkl".format(args.env, args.seed))
+    pkl_fpath = os.path.join(args.results_dir, "./{}_petrained_B_joint_seed-{}.pkl".format(args.env, args.seed))
     with open(pkl_fpath, "wb") as f:
         pickle.dump((ep_steps, rets, args.env), f)

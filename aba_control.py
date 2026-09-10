@@ -186,6 +186,9 @@ def main(args):
     env = NormalizeObservation(env)
     env = ClipAction(env)
 
+    base_env = env.unwrapped
+    original_ctrl_cost_weight = base_env._ctrl_cost_weight
+
     #### Reproducibility
     env.reset(seed=args.seed)
     env.action_space.seed(args.seed)
@@ -211,6 +214,24 @@ def main(args):
             # N.B: Action is a torch.Tensor
             action, action_info = agent.compute_action(obs)                
             sim_action = action.detach().cpu().view(-1).numpy()
+
+
+            # A -> B -> A reward-function change
+            if t == 5_000_000:
+                base_env._ctrl_cost_weight = 1.0
+                print(
+                    f"A -> B at t={t}: "
+                    f"ctrl_cost_weight {original_ctrl_cost_weight} -> "
+                    f"{base_env._ctrl_cost_weight}"
+                )
+
+            elif t == 10_000_000:
+                base_env._ctrl_cost_weight = original_ctrl_cost_weight
+                print(
+                    f"B -> A at t={t}: "
+                    f"ctrl_cost_weight 1.0 -> "
+                    f"{base_env._ctrl_cost_weight}"
+                )
 
             # Receive reward and next state
             next_obs, reward, terminated, truncated, _ = env.step(sim_action)
@@ -260,7 +281,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', default="HalfCheetah-v4", type=str, help="e.g., 'HalfCheetah-v4'")
     parser.add_argument('--seed', default=42, type=int, help="Seed for random number generator")       
-    parser.add_argument('--N', default=10001000, type=int, help="# timesteps for the run")
+    parser.add_argument('--N', default=15001000, type=int, help="# timesteps for the run")
     # SAVG params
     parser.add_argument('--actor_lr', default=0.0063, type=float, help="Actor step size")
     parser.add_argument('--critic_lr', default=0.0087, type=float, help="Critic step size")
@@ -301,6 +322,6 @@ if __name__ == "__main__":
 
     ### Saving data
     os.makedirs(args.results_dir, exist_ok=True)
-    pkl_fpath = os.path.join(args.results_dir, "./{}_avg_default_seed-{}.pkl".format(args.env, args.seed))
+    pkl_fpath = os.path.join(args.results_dir, "./{}_aba_control_seed-{}.pkl".format(args.env, args.seed))
     with open(pkl_fpath, "wb") as f:
         pickle.dump((ep_steps, rets, args.env), f)

@@ -186,6 +186,10 @@ def main(args):
     env = NormalizeObservation(env)
     env = ClipAction(env)
 
+    # wind
+    base_env = env.unwrapped
+    torso_id = base_env.model.body("torso").id
+
     #### Reproducibility
     env.reset(seed=args.seed)
     env.action_space.seed(args.seed)
@@ -211,6 +215,12 @@ def main(args):
             # N.B: Action is a torch.Tensor
             action, action_info = agent.compute_action(obs)                
             sim_action = action.detach().cpu().view(-1).numpy()
+
+            ## Wind regime
+            base_env.data.xfrc_applied[:] = 0.0
+
+            if 5_000_000 <= t < 10_000_000:
+                base_env.data.xfrc_applied[torso_id, 0] = -50.0
 
             # Receive reward and next state
             next_obs, reward, terminated, truncated, _ = env.step(sim_action)
@@ -260,7 +270,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', default="HalfCheetah-v4", type=str, help="e.g., 'HalfCheetah-v4'")
     parser.add_argument('--seed', default=42, type=int, help="Seed for random number generator")       
-    parser.add_argument('--N', default=10001000, type=int, help="# timesteps for the run")
+    parser.add_argument('--N', default=15001000, type=int, help="# timesteps for the run")
     # SAVG params
     parser.add_argument('--actor_lr', default=0.0063, type=float, help="Actor step size")
     parser.add_argument('--critic_lr', default=0.0087, type=float, help="Critic step size")
@@ -301,6 +311,6 @@ if __name__ == "__main__":
 
     ### Saving data
     os.makedirs(args.results_dir, exist_ok=True)
-    pkl_fpath = os.path.join(args.results_dir, "./{}_avg_default_seed-{}.pkl".format(args.env, args.seed))
+    pkl_fpath = os.path.join(args.results_dir, "./{}_aba_wind_seed-{}.pkl".format(args.env, args.seed))
     with open(pkl_fpath, "wb") as f:
         pickle.dump((ep_steps, rets, args.env), f)

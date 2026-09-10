@@ -186,6 +186,8 @@ def main(args):
     env = NormalizeObservation(env)
     env = ClipAction(env)
 
+    base_env = env.unwrapped
+
     #### Reproducibility
     env.reset(seed=args.seed)
     env.action_space.seed(args.seed)
@@ -211,6 +213,15 @@ def main(args):
             # N.B: Action is a torch.Tensor
             action, action_info = agent.compute_action(obs)                
             sim_action = action.detach().cpu().view(-1).numpy()
+
+
+            # A -> B reward-function change
+            if t == 5_000_000:
+                base_env._ctrl_cost_weight = 1.0
+                print(
+                    f"Reward regime changed at t={t}: "
+                    f"ctrl_cost_weight 0.1 -> {base_env._ctrl_cost_weight}"
+                )
 
             # Receive reward and next state
             next_obs, reward, terminated, truncated, _ = env.step(sim_action)
@@ -301,6 +312,6 @@ if __name__ == "__main__":
 
     ### Saving data
     os.makedirs(args.results_dir, exist_ok=True)
-    pkl_fpath = os.path.join(args.results_dir, "./{}_avg_default_seed-{}.pkl".format(args.env, args.seed))
+    pkl_fpath = os.path.join(args.results_dir, "./{}_ab_control_seed-{}.pkl".format(args.env, args.seed))
     with open(pkl_fpath, "wb") as f:
         pickle.dump((ep_steps, rets, args.env), f)
