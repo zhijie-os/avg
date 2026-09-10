@@ -1,3 +1,0 @@
-experiment,baseline,seed,segment_index,visit_index,regime_id,start_step,end_step,episodes,first_episode_return,mean_episode_return,last_20pct_return,cumulative_reward_auc
-gravity_ab,continuous_avg,0,0,0,A,0,5000000,5000,-214.39492109217505,4310.524210022966,5894.785147388246,21552621.050114833
-gravity_ab,continuous_avg,0,1,0,B,5000000,10000000,5000,-243.77160804293084,6355.635676491604,6767.527977213338,31778178.38245802
