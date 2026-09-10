@@ -186,21 +186,23 @@ def main(args):
     env = NormalizeObservation(env)
     env = ClipAction(env)
 
-
-    # ---------------------------------------------------------
-    # A -> B joint malfunction
-    # B: reverse the torque polarity of one HalfCheetah actuator
-    # ---------------------------------------------------------
     base_env = env.unwrapped
 
-    malfunction_actuator = 0
+    # ---------------------------------------------------------
+    # A -> B -> A combined regime
+    # ---------------------------------------------------------
 
-    # Store original gear so the modification is defined relative
-    # to the original environment.
+    # Control-cost reward
+    original_ctrl_cost_weight = base_env._ctrl_cost_weight
+
+    # Joint malfunction
+    malfunction_actuator = 0
     original_gear = base_env.model.actuator_gear[
         malfunction_actuator, 0
     ].copy()
 
+    # Wind
+    torso_id = base_env.model.body("torso").id
 
     #### Reproducibility
     env.reset(seed=args.seed)
@@ -229,20 +231,43 @@ def main(args):
             sim_action = action.detach().cpu().view(-1).numpy()
 
 
-            # -------------------------------------------------
-            # Regime change: A -> B
-            # Reverse torque direction of one joint at shift_step
-            # -------------------------------------------------
+            # ---------------------------------------------------------
+            # A -> B -> A combined regime
+            # ---------------------------------------------------------
+
+            # Always clear external forces first
+            base_env.data.xfrc_applied[:] = 0.0
+
             if t == 5_000_000:
+                # A -> B
+
+                # 1. Increase control-cost penalty
+                base_env._ctrl_cost_weight = 1.0
+
+                # 2. Reverse actuator 0 torque polarity
                 base_env.model.actuator_gear[
                     malfunction_actuator, 0
                 ] = -original_gear
 
-                print(
-                    f"Joint malfunction at t={t}: "
-                    f"actuator {malfunction_actuator} gear "
-                    f"{original_gear} -> {-original_gear}"
-                )
+                print(f"A -> B combined regime at t={t}")
+
+            elif t == 10_000_000:
+                # B -> A
+
+                # 1. Restore original control-cost penalty
+                base_env._ctrl_cost_weight = original_ctrl_cost_weight
+
+                # 2. Restore original actuator polarity
+                base_env.model.actuator_gear[
+                    malfunction_actuator, 0
+                ] = original_gear
+
+                print(f"B -> A combined regime at t={t}")
+
+            # 3. Wind exists only during B
+            if 5_000_000 <= t < 10_000_000:
+                base_env.data.xfrc_applied[torso_id, 0] = -50.0
+
 
             # Receive reward and next state
             next_obs, reward, terminated, truncated, _ = env.step(sim_action)
@@ -292,7 +317,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument('--env', default="HalfCheetah-v4", type=str, help="e.g., 'HalfCheetah-v4'")
     parser.add_argument('--seed', default=42, type=int, help="Seed for random number generator")       
-    parser.add_argument('--N', default=10001000, type=int, help="# timesteps for the run")
+    parser.add_argument('--N', default=15001000, type=int, help="# timesteps for the run")
     # SAVG params
     parser.add_argument('--actor_lr', default=0.0063, type=float, help="Actor step size")
     parser.add_argument('--critic_lr', default=0.0087, type=float, help="Critic step size")
@@ -333,6 +358,6 @@ if __name__ == "__main__":
 
     ### Saving data
     os.makedirs(args.results_dir, exist_ok=True)
-    pkl_fpath = os.path.join(args.results_dir, "./{}_ab_joint_seed-{}.pkl".format(args.env, args.seed))
+    pkl_fpath = os.path.join(args.results_dir, "./{}_aba_combined_seed-{}.pkl".format(args.env, args.seed))
     with open(pkl_fpath, "wb") as f:
         pickle.dump((ep_steps, rets, args.env), f)

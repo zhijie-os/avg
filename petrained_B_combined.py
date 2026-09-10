@@ -186,8 +186,26 @@ def main(args):
     env = NormalizeObservation(env)
     env = ClipAction(env)
 
-    # wind
     base_env = env.unwrapped
+
+    # ---------------------------------------------------------
+    # Regime B from step 0
+    # ---------------------------------------------------------
+
+    # 1. Increased control-cost penalty
+    base_env._ctrl_cost_weight = 1.0
+
+    # 2. Reverse actuator 0 torque polarity
+    malfunction_actuator = 0
+    original_gear = base_env.model.actuator_gear[
+        malfunction_actuator, 0
+    ].copy()
+
+    base_env.model.actuator_gear[
+        malfunction_actuator, 0
+    ] = -original_gear
+
+    # 3. Wind target
     torso_id = base_env.model.body("torso").id
 
     #### Reproducibility
@@ -216,11 +234,9 @@ def main(args):
             action, action_info = agent.compute_action(obs)                
             sim_action = action.detach().cpu().view(-1).numpy()
 
-            ## Wind regime
+            # Wind active throughout regime B
             base_env.data.xfrc_applied[:] = 0.0
-
-            if t >= 5_000_000:
-                base_env.data.xfrc_applied[torso_id, 0] = -50.0
+            base_env.data.xfrc_applied[torso_id, 0] = -50.0
 
             # Receive reward and next state
             next_obs, reward, terminated, truncated, _ = env.step(sim_action)
@@ -311,6 +327,6 @@ if __name__ == "__main__":
 
     ### Saving data
     os.makedirs(args.results_dir, exist_ok=True)
-    pkl_fpath = os.path.join(args.results_dir, "./{}_ab_wind_seed-{}.pkl".format(args.env, args.seed))
+    pkl_fpath = os.path.join(args.results_dir, "./{}_petrained_B_combined_seed-{}.pkl".format(args.env, args.seed))
     with open(pkl_fpath, "wb") as f:
         pickle.dump((ep_steps, rets, args.env), f)
