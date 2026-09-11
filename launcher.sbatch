@@ -23,7 +23,7 @@ shift
 echo "Running: $SCRIPT"
 echo "Extra args: $@"
 
-python "$SCRIPT" \
+python -u "$SCRIPT" \
     --results_dir ./results \
     --device cpu \
     "$@"
