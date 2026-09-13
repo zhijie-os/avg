@@ -213,13 +213,13 @@ class AVG:
 
         self.regime_log_path = os.path.join(
             cfg.results_dir,
-            f"{cfg.run_id}_regime_changes.log",
+            f"{cfg.run_id}_aba_joint_regime_changes.log",
         )
 
         # Periodic detector trace, useful even when no change fires.
         self.detector_trace_path = os.path.join(
             cfg.results_dir,
-            f"{cfg.run_id}_detector_trace.csv",
+            f"{cfg.run_id}_aba_joint_detector_trace.csv",
         )
 
         with open(self.detector_trace_path, "w") as f:

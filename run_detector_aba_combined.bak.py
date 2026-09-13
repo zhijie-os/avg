@@ -299,18 +299,6 @@ class AVG:
             f"{cfg.run_id}_regime_changes.log",
         )
 
-        # Periodic detector trace for debugging/plotting.
-        self.detector_trace_path = os.path.join(
-            cfg.results_dir,
-            f"{cfg.run_id}_detector_trace.csv",
-        )
-
-        with open(self.detector_trace_path, "w") as f:
-            f.write(
-                "step,e_P,e_R,e_P_bar,e_R_bar,D_t,c_t,"
-                "regime_change\n"
-            )
-
         # -------------------------------------------------
         # Actor / critic
         # -------------------------------------------------
@@ -361,7 +349,6 @@ class AVG:
         self.detector_h = 3.0
 
         self.detector_warmup = 1000
-        self.detector_log_interval = cfg.detector_log_interval
 
         self.steps_since_change = 0
 
@@ -688,21 +675,6 @@ class AVG:
         # AFTER calculating this transition's surprise.
         self.reward_stats.update(reward)
 
-        # Periodically save detector signals even when no
-        # regime change is declared.
-        if self.steps % self.detector_log_interval == 0:
-            with open(self.detector_trace_path, "a") as f:
-                f.write(
-                    f"{self.steps},"
-                    f"{e_P:.8f},"
-                    f"{e_R:.8f},"
-                    f"{e_P_bar:.8f},"
-                    f"{e_R_bar:.8f},"
-                    f"{D_t:.8f},"
-                    f"{self.change_score:.8f},"
-                    f"{int(regime_change)}\n"
-                )
-
         self.steps_since_change += 1
 
         # =================================================
@@ -855,7 +827,6 @@ def main(args):
             "%Y%m%d_%H%M%S"
         )
         +
-        f"-combined"
         f"-{args.algo}"
         f"-{args.env}"
         f"_seed-{args.seed}"
@@ -1277,13 +1248,6 @@ if __name__ == "__main__":
         "--predictor_lr",
         default=1e-4,
         type=float,
-    )
-
-    parser.add_argument(
-        "--detector_log_interval",
-        default=1000,
-        type=int,
-        help="Write detector trace every N environment steps",
     )
 
     # =====================================================
