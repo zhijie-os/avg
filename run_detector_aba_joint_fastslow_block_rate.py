@@ -1,0 +1,1987 @@
+import torch
+import time
+import pickle
+import argparse
+import copy
+import os
+import traceback
+
+import numpy as np
+import torch.nn as nn
+import gymnasium as gym
+import torch.nn.functional as F
+
+from torch.distributions import MultivariateNormal
+from gymnasium.wrappers import NormalizeObservation, ClipAction
+from datetime import datetime
+from incremental_rl.experiment_tracker import record_video
+from incremental_rl.td_error_scaler import TDErrorScaler
+
+
+# =========================================================
+# Utilities
+# =========================================================
+
+def orthogonal_weight_init(m):
+    """Orthogonal weight initialization for neural networks."""
+    if isinstance(m, nn.Linear):
+        nn.init.orthogonal_(m.weight.data)
+        m.bias.data.fill_(0.0)
+
+
+def human_format_numbers(num, use_float=False):
+    magnitude = 0
+
+    while abs(num) >= 1000:
+        magnitude += 1
+        num /= 1000.0
+
+    if use_float:
+        return "%.2f%s" % (
+            num,
+            ["", "K", "M", "G", "T", "P"][magnitude],
+        )
+
+    return "%d%s" % (
+        num,
+        ["", "K", "M", "G", "T", "P"][magnitude],
+    )
+
+
+def set_one_thread():
+    """
+    N.B: PyTorch over-allocates CPU resources.
+    """
+    os.environ["OMP_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    torch.set_num_threads(1)
+
+
+# =========================================================
+# Raw observation passthrough
+# =========================================================
+
+class RawObservationInfo(gym.Wrapper):
+    """
+    Preserve the flattened raw observation in info["raw_obs"] while
+    outer wrappers (e.g. NormalizeObservation) may transform the
+    observation seen by AVG.
+    """
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        info = dict(info)
+        info["raw_obs"] = np.asarray(obs, dtype=np.float32).copy()
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        info = dict(info)
+        info["raw_obs"] = np.asarray(obs, dtype=np.float32).copy()
+        return obs, reward, terminated, truncated, info
+
+
+# =========================================================
+# Running statistics
+# =========================================================
+
+class RunningStats:
+    """
+    Online mean/std using Welford's algorithm.
+    """
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.n = 0
+        self.mean = 0.0
+        self.M2 = 0.0
+
+    def update(self, x):
+        x = float(x)
+
+        self.n += 1
+
+        delta = x - self.mean
+        self.mean += delta / self.n
+
+        delta2 = x - self.mean
+        self.M2 += delta * delta2
+
+    @property
+    def std(self):
+        if self.n < 2:
+            return 1.0
+
+        variance = self.M2 / (self.n - 1)
+
+        return max(variance, 1e-8) ** 0.5
+
+
+# =========================================================
+# Actor
+# =========================================================
+
+class Actor(nn.Module):
+    """Continuous MLP Actor for Soft Actor-Critic."""
+
+    def __init__(self, obs_dim, action_dim, device, n_hid):
+        super(Actor, self).__init__()
+
+        self.device = device
+
+        self.LOG_STD_MAX = 2
+        self.LOG_STD_MIN = -20
+
+        self.phi = nn.Sequential(
+            nn.Linear(obs_dim, n_hid),
+            nn.LeakyReLU(),
+
+            nn.Linear(n_hid, n_hid),
+            nn.LeakyReLU(),
+        )
+
+        self.mu = nn.Linear(n_hid, action_dim)
+        self.log_std = nn.Linear(n_hid, action_dim)
+
+        self.apply(orthogonal_weight_init)
+        self.to(device=device)
+
+    def forward(self, obs):
+        phi = self.phi(obs.to(self.device))
+
+        phi = phi / torch.norm(
+            phi,
+            dim=1,
+        ).view((-1, 1))
+
+        mu = self.mu(phi)
+
+        log_std = self.log_std(phi)
+
+        log_std = torch.clamp(
+            log_std,
+            self.LOG_STD_MIN,
+            self.LOG_STD_MAX,
+        )
+
+        dist = MultivariateNormal(
+            mu,
+            torch.diag_embed(log_std.exp()),
+        )
+
+        action_pre = dist.rsample()
+
+        lprob = dist.log_prob(action_pre)
+
+        lprob -= (
+            2
+            * (
+                np.log(2)
+                - action_pre
+                - F.softplus(-2 * action_pre)
+            )
+        ).sum(axis=1)
+
+        action = torch.tanh(action_pre)
+
+        action_info = {
+            "mu": mu,
+            "log_std": log_std,
+            "dist": dist,
+            "lprob": lprob,
+            "action_pre": action_pre,
+        }
+
+        return action, action_info
+
+
+# =========================================================
+# Critic
+# =========================================================
+
+class Q(nn.Module):
+
+    def __init__(self, obs_dim, action_dim, device, n_hid):
+        super(Q, self).__init__()
+
+        self.device = device
+
+        self.phi = nn.Sequential(
+            nn.Linear(obs_dim + action_dim, n_hid),
+            nn.LeakyReLU(),
+
+            nn.Linear(n_hid, n_hid),
+            nn.LeakyReLU(),
+        )
+
+        self.q = nn.Linear(n_hid, 1)
+
+        self.apply(orthogonal_weight_init)
+        self.to(device=device)
+
+    def forward(self, obs, action):
+        x = torch.cat(
+            (obs, action),
+            dim=-1,
+        ).to(self.device)
+
+        phi = self.phi(x)
+
+        phi = phi / torch.norm(
+            phi,
+            dim=1,
+        ).view((-1, 1))
+
+        return self.q(phi).view(-1)
+
+
+# =========================================================
+# Probabilistic environment predictor
+#
+# p_n(S_{t+1}, R_{t+1} | S_t, A_t)
+#   = N(mu_n(S_t, A_t), Sigma_n(S_t, A_t))
+#
+# Sigma_n is diagonal and represented by a log-variance vector.
+# =========================================================
+
+class Predictor(nn.Module):
+
+    def __init__(
+        self,
+        obs_dim,
+        action_dim,
+        device,
+        n_hid=128,
+        logvar_min=-10.0,
+        logvar_max=5.0,
+    ):
+        super().__init__()
+
+        self.device = device
+        self.logvar_min = logvar_min
+        self.logvar_max = logvar_max
+        self.out_dim = obs_dim + 1  # next observation + reward
+
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim + action_dim, n_hid),
+            nn.LeakyReLU(),
+            nn.Linear(n_hid, n_hid),
+            nn.LeakyReLU(),
+        )
+
+        self.mean_head = nn.Linear(
+            n_hid,
+            self.out_dim,
+        )
+
+        self.logvar_head = nn.Linear(
+            n_hid,
+            self.out_dim,
+        )
+
+        self.apply(orthogonal_weight_init)
+        self.to(device)
+
+    def forward(self, raw_obs, action):
+
+        x = torch.cat(
+            (raw_obs, action),
+            dim=-1,
+        ).to(self.device)
+
+        h = self.net(x)
+
+        mean = self.mean_head(h)
+
+        logvar = torch.clamp(
+            self.logvar_head(h),
+            self.logvar_min,
+            self.logvar_max,
+        )
+
+        return mean, logvar
+
+
+def diagonal_gaussian_log_prob(target, mean, var):
+    """
+    Log p(target) for a diagonal Gaussian.
+
+    target, mean, var: [batch, dimension]
+    returns: [batch]
+    """
+    var = torch.clamp(var, min=1e-8)
+
+    return -0.5 * (
+        torch.log(
+            2.0
+            * torch.pi
+            * var
+        )
+        + (
+            (target - mean) ** 2
+            / var
+        )
+    ).sum(dim=-1)
+
+
+# =========================================================
+# AVG
+# =========================================================
+
+class AVG:
+
+    def __init__(self, cfg):
+
+        self.cfg = cfg
+        self.steps = 0
+
+        self.device = cfg.device
+
+        # -------------------------------------------------
+        # Fast-vs-slow block-rate detector logging
+        # -------------------------------------------------
+
+        os.makedirs(
+            cfg.results_dir,
+            exist_ok=True,
+        )
+
+        self.detector_trace_path = os.path.join(
+            cfg.results_dir,
+            f"{cfg.run_id}_fastslow_block_rate_trace_aba_joint.csv",
+        )
+
+        self.block_trace_path = os.path.join(
+            cfg.results_dir,
+            f"{cfg.run_id}_fastslow_block_rate_blocks_aba_joint.csv",
+        )
+
+        self.regime_log_path = os.path.join(
+            cfg.results_dir,
+            f"{cfg.run_id}_regime_changes_aba_joint.log",
+        )
+
+        with open(self.detector_trace_path, "w") as f:
+            f.write(
+                "step,fast_slow_gap,fast_wins,"
+                "block_completed,block_win_rate,"
+                "q_short,q_long,rate_gap,"
+                "detector_armed,regime_change,"
+                "positive_streak,rearm_streak,"
+                "rate_warmup_remaining,"
+                "initial_warmup_remaining,"
+                "log_p_fast,log_p_slow,"
+                "fast_mean_total_var,slow_mean_total_var,"
+                "fast_mean_epistemic_var,slow_mean_epistemic_var,"
+                "predictor_nll\n"
+            )
+
+        with open(self.block_trace_path, "w") as f:
+            f.write(
+                "block_end_step,block_win_rate,"
+                "q_short,q_long,rate_gap,"
+                "detector_armed,regime_change,"
+                "positive_streak,rearm_streak,"
+                "rate_warmup_remaining\n"
+            )
+
+        with open(self.regime_log_path, "w") as f:
+            f.write(
+                "step,block_win_rate,q_short,q_long,"
+                "rate_gap,positive_streak\n"
+            )
+
+        # -------------------------------------------------
+        # Actor / critic
+        # -------------------------------------------------
+
+        self.actor = Actor(
+            obs_dim=cfg.obs_dim,
+            action_dim=cfg.action_dim,
+            device=cfg.device,
+            n_hid=cfg.nhid_actor,
+        )
+
+        self.Q = Q(
+            obs_dim=cfg.obs_dim,
+            action_dim=cfg.action_dim,
+            device=cfg.device,
+            n_hid=cfg.nhid_critic,
+        )
+
+        # -------------------------------------------------
+        # Fast predictive ensemble
+        # -------------------------------------------------
+
+        self.fast_predictors = nn.ModuleList(
+            [
+                Predictor(
+                    obs_dim=cfg.obs_dim,
+                    action_dim=cfg.action_dim,
+                    device=cfg.device,
+                    n_hid=cfg.nhid_predictor,
+                    logvar_min=cfg.pred_logvar_min,
+                    logvar_max=cfg.pred_logvar_max,
+                )
+                for _ in range(cfg.num_predictors)
+            ]
+        )
+
+        self.fast_pred_opts = [
+            torch.optim.Adam(
+                predictor.parameters(),
+                lr=cfg.predictor_lr,
+            )
+            for predictor in self.fast_predictors
+        ]
+
+        # -------------------------------------------------
+        # Slow predictive reference
+        #
+        # The slow ensemble starts IDENTICAL to the fast
+        # ensemble. During initial warmup it is hard-synced to
+        # fast; afterward it follows fast by EMA and becomes a
+        # longer-timescale reference without replay data.
+        # -------------------------------------------------
+
+        self.slow_predictors = copy.deepcopy(
+            self.fast_predictors
+        )
+
+        for predictor in self.slow_predictors:
+            for param in predictor.parameters():
+                param.requires_grad_(False)
+
+        self.num_predictors = cfg.num_predictors
+        self.slow_ema = cfg.slow_ema
+        self.comparison_warmup = cfg.comparison_warmup
+        self.detector_log_interval = cfg.detector_log_interval
+
+        # -------------------------------------------------
+        # Block-aggregated short-vs-long fast-win detector
+        #
+        # Per transition:
+        #   I_t = 1[ log p_fast > log p_slow ]
+        #
+        # Aggregate correlated transitions into blocks:
+        #   b_k = (1/B) sum_{t in block k} I_t
+        #
+        # Track a short and a long EMA of the BLOCK win rate:
+        #   q_short <- beta_s q_short + (1-beta_s) b_k
+        #   q_long  <- beta_l q_long  + (1-beta_l) b_k
+        #
+        # where beta_s < beta_l. The detector uses
+        #   D_k = q_short - q_long.
+        #
+        # A change is declared only if D_k exceeds a threshold
+        # for several COMPLETE blocks in a row. After detection,
+        # the detector remains disarmed until D_k settles back
+        # near zero for several blocks. Predictors are NOT reset
+        # on an alarm, so the detector does not create its own
+        # fast/slow transient.
+        # -------------------------------------------------
+
+        self.block_size = cfg.block_size
+        self.short_rate_beta = cfg.short_rate_beta
+        self.long_rate_beta = cfg.long_rate_beta
+        self.rate_gap_threshold = cfg.rate_gap_threshold
+        self.rate_persistence_blocks = cfg.rate_persistence_blocks
+        self.rate_warmup_blocks = cfg.rate_warmup_blocks
+        self.rearm_gap_threshold = cfg.rearm_gap_threshold
+        self.rearm_persistence_blocks = cfg.rearm_persistence_blocks
+
+        if self.block_size <= 0:
+            raise ValueError("Require block_size > 0")
+
+        if not (
+            0.0 <= self.short_rate_beta
+            < self.long_rate_beta
+            < 1.0
+        ):
+            raise ValueError(
+                "Require 0 <= short_rate_beta < long_rate_beta < 1"
+            )
+
+        if self.rate_gap_threshold <= 0.0:
+            raise ValueError("Require rate_gap_threshold > 0")
+
+        if self.rate_persistence_blocks <= 0:
+            raise ValueError("Require rate_persistence_blocks > 0")
+
+        if self.rate_warmup_blocks <= 0:
+            raise ValueError("Require rate_warmup_blocks > 0")
+
+        if not (
+            0.0 <= self.rearm_gap_threshold
+            < self.rate_gap_threshold
+        ):
+            raise ValueError(
+                "Require 0 <= rearm_gap_threshold < rate_gap_threshold"
+            )
+
+        if self.rearm_persistence_blocks <= 0:
+            raise ValueError("Require rearm_persistence_blocks > 0")
+
+        # Initial predictor warmup: slow is hard-synchronized to fast.
+        self.warmup_remaining = self.comparison_warmup
+
+        # Current block accumulator. We only start collecting blocks
+        # after the predictor warmup has finished.
+        self.block_wins = 0
+        self.block_count = 0
+
+        # Short/long block-rate estimates.
+        self.q_short = None
+        self.q_long = None
+
+        # Allow the two rate estimates to establish themselves before
+        # the detector is first armed.
+        self.rate_warmup_remaining = self.rate_warmup_blocks
+
+        self.detector_armed = False
+        self.positive_streak = 0
+        self.rearm_streak = 0
+
+        # -------------------------------------------------
+        # Actor / critic optimizers
+        # -------------------------------------------------
+
+        self.popt = torch.optim.Adam(
+            self.actor.parameters(),
+            lr=cfg.actor_lr,
+            betas=cfg.betas,
+        )
+
+        self.qopt = torch.optim.Adam(
+            self.Q.parameters(),
+            lr=cfg.critic_lr,
+            betas=cfg.betas,
+        )
+
+        # -------------------------------------------------
+        # AVG state
+        # -------------------------------------------------
+
+        self.alpha = cfg.alpha_lr
+        self.gamma = cfg.gamma
+
+        self.td_error_scaler = TDErrorScaler()
+
+        self.G = 0
+
+
+    # =====================================================
+    # Predictor synchronization helpers
+    # =====================================================
+
+    def hard_sync_slow_to_fast(self):
+        """Copy the fast ensemble exactly into the slow ensemble."""
+
+        with torch.no_grad():
+            for fast_predictor, slow_predictor in zip(
+                self.fast_predictors,
+                self.slow_predictors,
+            ):
+                slow_predictor.load_state_dict(
+                    fast_predictor.state_dict()
+                )
+
+
+    def ema_update_slow_from_fast(self):
+        """EMA update of the slow predictive reference."""
+
+        with torch.no_grad():
+            for fast_predictor, slow_predictor in zip(
+                self.fast_predictors,
+                self.slow_predictors,
+            ):
+                for fast_param, slow_param in zip(
+                    fast_predictor.parameters(),
+                    slow_predictor.parameters(),
+                ):
+                    slow_param.mul_(
+                        self.slow_ema
+                    )
+                    slow_param.add_(
+                        fast_param,
+                        alpha=(
+                            1.0
+                            - self.slow_ema
+                        ),
+                    )
+
+
+    # =====================================================
+    # Action
+    # =====================================================
+
+    def compute_action(self, obs):
+
+        obs = torch.Tensor(
+            obs.astype(np.float32)
+        ).unsqueeze(0).to(self.device)
+
+        action, action_info = self.actor(obs)
+
+        return action, action_info
+
+
+    # =====================================================
+    # Update
+    # =====================================================
+
+    def update(
+        self,
+        obs,
+        action,
+        next_obs,
+        reward,
+        done,
+        raw_obs,
+        raw_next_obs,
+        **kwargs,
+    ):
+
+        # AVG actor/critic observations remain normalized by
+        # Gymnasium's NormalizeObservation wrapper.
+        obs = torch.tensor(
+            obs.astype(np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
+
+        next_obs = torch.tensor(
+            next_obs.astype(np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
+
+        # The detector gets RAW flattened environment observations.
+        raw_obs = torch.tensor(
+            raw_obs.astype(np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
+
+        raw_next_obs = torch.tensor(
+            raw_next_obs.astype(np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
+
+        action = action.to(self.device)
+        detector_action = action.detach()
+
+        lprob = kwargs["lprob"]
+
+        reward_tensor = torch.tensor(
+            [[reward]],
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        # Joint detector target:
+        # [S_{t+1}, R_{t+1}]
+        detector_target = torch.cat(
+            (
+                raw_next_obs,
+                reward_tensor,
+            ),
+            dim=-1,
+        )
+
+        # =================================================
+        # 1. Score BOTH timescales BEFORE training on this
+        #    transition.
+        # =================================================
+
+        fast_outputs = []
+        slow_outputs = []
+
+        for fast_predictor, slow_predictor in zip(
+            self.fast_predictors,
+            self.slow_predictors,
+        ):
+
+            fast_mean_n, fast_logvar_n = fast_predictor(
+                raw_obs,
+                detector_action,
+            )
+
+            fast_var_n = torch.exp(
+                fast_logvar_n
+            )
+
+            fast_outputs.append(
+                (
+                    fast_mean_n,
+                    fast_logvar_n,
+                    fast_var_n,
+                )
+            )
+
+            with torch.no_grad():
+
+                slow_mean_n, slow_logvar_n = slow_predictor(
+                    raw_obs,
+                    detector_action,
+                )
+
+                slow_var_n = torch.exp(
+                    slow_logvar_n
+                )
+
+            slow_outputs.append(
+                (
+                    slow_mean_n,
+                    slow_logvar_n,
+                    slow_var_n,
+                )
+            )
+
+        with torch.no_grad():
+
+            # ---------------------------------------------
+            # Fast ensemble distribution
+            # ---------------------------------------------
+
+            fast_means = torch.stack(
+                [
+                    output[0].detach()
+                    for output in fast_outputs
+                ],
+                dim=0,
+            )
+
+            fast_variances = torch.stack(
+                [
+                    output[2].detach()
+                    for output in fast_outputs
+                ],
+                dim=0,
+            )
+
+            fast_mu = fast_means.mean(
+                dim=0
+            )
+
+            fast_var = (
+                (
+                    fast_variances
+                    + fast_means.pow(2)
+                ).mean(dim=0)
+                - fast_mu.pow(2)
+            )
+
+            fast_var = torch.clamp(
+                fast_var,
+                min=1e-8,
+            )
+
+            fast_epistemic_var = (
+                (
+                    fast_means
+                    - fast_mu.unsqueeze(0)
+                ).pow(2)
+            ).mean(dim=0)
+
+            # ---------------------------------------------
+            # Slow ensemble distribution
+            # ---------------------------------------------
+
+            slow_means = torch.stack(
+                [
+                    output[0].detach()
+                    for output in slow_outputs
+                ],
+                dim=0,
+            )
+
+            slow_variances = torch.stack(
+                [
+                    output[2].detach()
+                    for output in slow_outputs
+                ],
+                dim=0,
+            )
+
+            slow_mu = slow_means.mean(
+                dim=0
+            )
+
+            slow_var = (
+                (
+                    slow_variances
+                    + slow_means.pow(2)
+                ).mean(dim=0)
+                - slow_mu.pow(2)
+            )
+
+            slow_var = torch.clamp(
+                slow_var,
+                min=1e-8,
+            )
+
+            slow_epistemic_var = (
+                (
+                    slow_means
+                    - slow_mu.unsqueeze(0)
+                ).pow(2)
+            ).mean(dim=0)
+
+            # ---------------------------------------------
+            # Fast-vs-slow predictive evidence
+            #
+            # Positive gap:
+            # recent/fast model explains this transition
+            # better than the slow reference.
+            # ---------------------------------------------
+
+            log_p_fast = diagonal_gaussian_log_prob(
+                detector_target,
+                fast_mu,
+                fast_var,
+            )
+
+            log_p_slow = diagonal_gaussian_log_prob(
+                detector_target,
+                slow_mu,
+                slow_var,
+            )
+
+            fast_slow_gap = (
+                log_p_fast
+                - log_p_slow
+            ).item()
+
+            fast_wins = int(
+                fast_slow_gap > 0.0
+            )
+
+            log_p_fast_value = (
+                log_p_fast.item()
+            )
+
+            log_p_slow_value = (
+                log_p_slow.item()
+            )
+
+            fast_mean_total_var = (
+                fast_var.mean().item()
+            )
+
+            slow_mean_total_var = (
+                slow_var.mean().item()
+            )
+
+            fast_mean_epistemic_var = (
+                fast_epistemic_var.mean().item()
+            )
+
+            slow_mean_epistemic_var = (
+                slow_epistemic_var.mean().item()
+            )
+
+        # =================================================
+        # 2. Block-aggregated short-vs-long win-rate detector
+        #
+        # IMPORTANT:
+        # - Individual fast-win samples are NOT treated as
+        #   independent sequential evidence.
+        # - We first aggregate block_size transitions into one
+        #   block win rate.
+        # - The detector is evaluated only at block boundaries.
+        # - Predictor warmup disables block accumulation.
+        # =================================================
+
+        regime_change = False
+        block_completed = False
+        block_win_rate = float("nan")
+
+        if self.q_short is None:
+            q_short_for_log = float("nan")
+            q_long_for_log = float("nan")
+            rate_gap_for_log = float("nan")
+        else:
+            q_short_for_log = float(self.q_short)
+            q_long_for_log = float(self.q_long)
+            rate_gap_for_log = float(
+                self.q_short - self.q_long
+            )
+
+        if self.warmup_remaining == 0:
+
+            self.block_wins += int(fast_wins)
+            self.block_count += 1
+
+            if self.block_count >= self.block_size:
+
+                block_completed = True
+
+                block_win_rate = (
+                    float(self.block_wins)
+                    / float(self.block_count)
+                )
+
+                self.block_wins = 0
+                self.block_count = 0
+
+                # -----------------------------------------
+                # Update short/long BLOCK-rate estimates.
+                # -----------------------------------------
+
+                if self.q_short is None:
+
+                    self.q_short = block_win_rate
+                    self.q_long = block_win_rate
+
+                else:
+
+                    self.q_short = (
+                        self.short_rate_beta
+                        * self.q_short
+                        + (1.0 - self.short_rate_beta)
+                        * block_win_rate
+                    )
+
+                    self.q_long = (
+                        self.long_rate_beta
+                        * self.q_long
+                        + (1.0 - self.long_rate_beta)
+                        * block_win_rate
+                    )
+
+                q_short_for_log = float(self.q_short)
+                q_long_for_log = float(self.q_long)
+
+                rate_gap_for_log = float(
+                    self.q_short
+                    - self.q_long
+                )
+
+                # -----------------------------------------
+                # Initial rate-estimation warmup.
+                # -----------------------------------------
+
+                if self.rate_warmup_remaining > 0:
+
+                    self.rate_warmup_remaining -= 1
+                    self.detector_armed = False
+                    self.positive_streak = 0
+                    self.rearm_streak = 0
+
+                    if self.rate_warmup_remaining == 0:
+                        self.detector_armed = True
+
+                # -----------------------------------------
+                # Armed: require a persistent positive gap.
+                # -----------------------------------------
+
+                elif self.detector_armed:
+
+                    if (
+                        rate_gap_for_log
+                        > self.rate_gap_threshold
+                    ):
+                        self.positive_streak += 1
+                    else:
+                        self.positive_streak = 0
+
+                    if (
+                        self.positive_streak
+                        >= self.rate_persistence_blocks
+                    ):
+                        regime_change = True
+
+                        print(
+                            f"REGIME CHANGE detected at step={self.steps}: "
+                            f"block_rate={block_win_rate:.3f}, "
+                            f"q_short={self.q_short:.3f}, "
+                            f"q_long={self.q_long:.3f}, "
+                            f"gap={rate_gap_for_log:.3f}"
+                        )
+
+                        with open(
+                            self.regime_log_path,
+                            "a",
+                        ) as f:
+                            f.write(
+                                f"{self.steps},"
+                                f"{block_win_rate:.8f},"
+                                f"{self.q_short:.8f},"
+                                f"{self.q_long:.8f},"
+                                f"{rate_gap_for_log:.8f},"
+                                f"{self.positive_streak}\n"
+                            )
+
+                        # Do NOT reset either predictive ensemble.
+                        # We only disarm the decision rule so one
+                        # sustained adaptation transient is reported
+                        # as one regime change.
+                        self.detector_armed = False
+                        self.positive_streak = 0
+                        self.rearm_streak = 0
+
+                # -----------------------------------------
+                # Disarmed after a detection: keep observing.
+                # Rearm only after short/long rates genuinely
+                # reconverge instead of waiting a fixed number
+                # of environment steps.
+                # -----------------------------------------
+
+                else:
+
+                    if (
+                        abs(rate_gap_for_log)
+                        <= self.rearm_gap_threshold
+                    ):
+                        self.rearm_streak += 1
+                    else:
+                        self.rearm_streak = 0
+
+                    if (
+                        self.rearm_streak
+                        >= self.rearm_persistence_blocks
+                    ):
+                        self.detector_armed = True
+                        self.rearm_streak = 0
+                        self.positive_streak = 0
+
+                # One compact row per completed block.
+                with open(
+                    self.block_trace_path,
+                    "a",
+                ) as f:
+                    f.write(
+                        f"{self.steps},"
+                        f"{block_win_rate:.8f},"
+                        f"{q_short_for_log:.8f},"
+                        f"{q_long_for_log:.8f},"
+                        f"{rate_gap_for_log:.8f},"
+                        f"{int(self.detector_armed)},"
+                        f"{int(regime_change)},"
+                        f"{self.positive_streak},"
+                        f"{self.rearm_streak},"
+                        f"{self.rate_warmup_remaining}\n"
+                    )
+
+        # =================================================
+        # 4. Update ONLY the fast ensemble on the current
+        #    streaming transition using online Poisson
+        #    bootstrap weights.
+        # =================================================
+
+        predictor_nll_values = []
+
+        for n, (
+            mean_n,
+            logvar_n,
+            var_n,
+        ) in enumerate(fast_outputs):
+
+            # One transition, at most one optimizer step.
+            # k=0 means this bootstrap member skips it;
+            # k>0 scales the Gaussian NLL.
+            k_n_t = np.random.poisson(1.0)
+
+            if k_n_t == 0:
+                continue
+
+            log_prob_n = diagonal_gaussian_log_prob(
+                detector_target,
+                mean_n,
+                var_n,
+            )
+
+            nll_n = -log_prob_n.mean()
+
+            loss_n = (
+                float(k_n_t)
+                * nll_n
+            )
+
+            self.fast_pred_opts[n].zero_grad()
+
+            loss_n.backward()
+
+            self.fast_pred_opts[n].step()
+
+            predictor_nll_values.append(
+                nll_n.detach().item()
+            )
+
+        if predictor_nll_values:
+            predictor_nll = float(
+                np.mean(
+                    predictor_nll_values
+                )
+            )
+        else:
+            predictor_nll = float("nan")
+
+        # =================================================
+        # 4. Update the slow reference AFTER the fast update.
+        #
+        # Startup warmup:
+        #     slow <- fast exactly
+        #
+        # After warmup:
+        #     slow <- beta * slow + (1-beta) * fast
+        #
+        # IMPORTANT:
+        # A detector alarm does NOT modify either predictive
+        # ensemble. This keeps the detector from perturbing the
+        # signal it is trying to measure.
+        # =================================================
+
+        if self.warmup_remaining > 0:
+
+            self.hard_sync_slow_to_fast()
+            self.warmup_remaining -= 1
+
+        else:
+
+            self.ema_update_slow_from_fast()
+
+        # =================================================
+        # 5. Diagnostic logging
+        # =================================================
+
+        if (
+            block_completed
+            or regime_change
+            or self.steps % self.detector_log_interval == 0
+        ):
+
+            with open(
+                self.detector_trace_path,
+                "a",
+            ) as f:
+
+                f.write(
+                    f"{self.steps},"
+                    f"{fast_slow_gap:.8f},"
+                    f"{fast_wins},"
+                    f"{int(block_completed)},"
+                    f"{block_win_rate:.8f},"
+                    f"{q_short_for_log:.8f},"
+                    f"{q_long_for_log:.8f},"
+                    f"{rate_gap_for_log:.8f},"
+                    f"{int(self.detector_armed)},"
+                    f"{int(regime_change)},"
+                    f"{self.positive_streak},"
+                    f"{self.rearm_streak},"
+                    f"{self.rate_warmup_remaining},"
+                    f"{self.warmup_remaining},"
+                    f"{log_p_fast_value:.8f},"
+                    f"{log_p_slow_value:.8f},"
+                    f"{fast_mean_total_var:.8f},"
+                    f"{slow_mean_total_var:.8f},"
+                    f"{fast_mean_epistemic_var:.8f},"
+                    f"{slow_mean_epistemic_var:.8f},"
+                    f"{predictor_nll:.8f}\n"
+                )
+
+        # =================================================
+        # 6. Original AVG update
+        # =================================================
+
+        # -------------------------------------------------
+        # Return scaling
+        # -------------------------------------------------
+
+        r_ent = (
+            reward
+            - self.alpha
+            * lprob.detach().item()
+        )
+
+        self.G += r_ent
+
+        if done:
+
+            self.td_error_scaler.update(
+                reward=r_ent,
+                gamma=0,
+                G=self.G,
+            )
+
+            self.G = 0
+
+        else:
+
+            self.td_error_scaler.update(
+                reward=r_ent,
+                gamma=self.cfg.gamma,
+                G=None,
+            )
+
+        # -------------------------------------------------
+        # Q loss
+        # -------------------------------------------------
+
+        q = self.Q(
+            obs,
+            action.detach(),
+        )
+
+        with torch.no_grad():
+
+            next_action, action_info = self.actor(
+                next_obs
+            )
+
+            next_lprob = action_info["lprob"]
+
+            q2 = self.Q(
+                next_obs,
+                next_action,
+            )
+
+            target_V = (
+                q2
+                - self.alpha
+                * next_lprob
+            )
+
+        delta = (
+            reward
+            + (1 - done)
+            * self.gamma
+            * target_V
+            - q
+        )
+
+        delta /= self.td_error_scaler.sigma
+
+        qloss = delta ** 2
+
+        # -------------------------------------------------
+        # Policy loss
+        # -------------------------------------------------
+
+        ploss = (
+            self.alpha * lprob
+            - self.Q(obs, action)
+        )
+
+        self.popt.zero_grad()
+
+        ploss.backward()
+
+        self.popt.step()
+
+        self.qopt.zero_grad()
+
+        qloss.backward()
+
+        self.qopt.step()
+
+        self.steps += 1
+
+        return {
+            "fast_slow_gap": fast_slow_gap,
+            "fast_wins": fast_wins,
+            "block_completed": block_completed,
+            "block_win_rate": block_win_rate,
+            "q_short": q_short_for_log,
+            "q_long": q_long_for_log,
+            "rate_gap": rate_gap_for_log,
+            "detector_armed": self.detector_armed,
+            "regime_change": regime_change,
+            "positive_streak": self.positive_streak,
+            "rearm_streak": self.rearm_streak,
+            "rate_warmup_remaining": self.rate_warmup_remaining,
+            "log_p_fast": log_p_fast_value,
+            "log_p_slow": log_p_slow_value,
+            "fast_mean_total_var": fast_mean_total_var,
+            "slow_mean_total_var": slow_mean_total_var,
+            "fast_mean_epistemic_var": fast_mean_epistemic_var,
+            "slow_mean_epistemic_var": slow_mean_epistemic_var,
+            "warmup_remaining": self.warmup_remaining,
+            "predictor_nll": predictor_nll,
+        }
+
+
+
+    # =====================================================
+    # Save
+    # =====================================================
+
+    def save(self, model_dir, unique_str):
+
+        model = {
+            "actor": self.actor.state_dict(),
+            "critic": self.Q.state_dict(),
+
+            "fast_predictors": [
+                predictor.state_dict()
+                for predictor in self.fast_predictors
+            ],
+
+            "slow_predictors": [
+                predictor.state_dict()
+                for predictor in self.slow_predictors
+            ],
+
+            "policy_opt": self.popt.state_dict(),
+            "critic_opt": self.qopt.state_dict(),
+
+            "fast_predictor_opts": [
+                opt.state_dict()
+                for opt in self.fast_pred_opts
+            ],
+
+            "warmup_remaining": self.warmup_remaining,
+            "block_wins": self.block_wins,
+            "block_count": self.block_count,
+            "q_short": self.q_short,
+            "q_long": self.q_long,
+            "rate_warmup_remaining": self.rate_warmup_remaining,
+            "detector_armed": self.detector_armed,
+            "positive_streak": self.positive_streak,
+            "rearm_streak": self.rearm_streak,
+        }
+
+        torch.save(
+            model,
+            "%s/%s.pt" % (
+                model_dir,
+                unique_str,
+            ),
+        )
+
+
+# =========================================================
+# Experiment
+# =========================================================
+
+def main(args):
+
+    tic = time.time()
+
+    run_id = (
+        datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+        +
+        f"-joint-fastslow-block-rate"
+        f"-{args.algo}"
+        f"-{args.env}"
+        f"_seed-{args.seed}"
+    )
+
+    # IMPORTANT:
+    # AVG.__init__ needs this for trace-file naming.
+    args.run_id = run_id
+
+    # =====================================================
+    # Environment
+    # =====================================================
+
+    env = gym.make(args.env)
+
+    env = gym.wrappers.FlattenObservation(env)
+
+    # Preserve raw flattened observations for the detector.
+    env = RawObservationInfo(env)
+
+    # AVG still receives its usual normalized observations.
+    env = NormalizeObservation(env)
+
+    env = ClipAction(env)
+
+    base_env = env.unwrapped
+
+    # =====================================================
+    # A -> B -> A joint-malfunction regime
+    # =====================================================
+
+    malfunction_actuator = 0
+
+    original_gear = (
+        base_env.model.actuator_gear[
+            malfunction_actuator,
+            0,
+        ].copy()
+    )
+
+    # =====================================================
+    # Reproducibility
+    # =====================================================
+
+    env.action_space.seed(args.seed)
+
+    np.random.seed(args.seed)
+
+    torch.manual_seed(args.seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+
+    # =====================================================
+    # Learner
+    # =====================================================
+
+    args.obs_dim = (
+        env.observation_space.shape[0]
+    )
+
+    args.action_dim = (
+        env.action_space.shape[0]
+    )
+
+    agent = AVG(args)
+
+    # =====================================================
+    # Interaction
+    # =====================================================
+
+    rets = []
+    ep_steps = []
+
+    ret = 0
+    step = 0
+
+    terminated = False
+    truncated = False
+
+    obs, info = env.reset(seed=args.seed)
+    raw_obs = info["raw_obs"]
+
+    ep_tic = time.time()
+
+    try:
+
+        for t in range(args.N):
+
+            # ---------------------------------------------
+            # Action
+            # ---------------------------------------------
+
+            action, action_info = (
+                agent.compute_action(obs)
+            )
+
+            sim_action = (
+                action.detach()
+                .cpu()
+                .view(-1)
+                .numpy()
+            )
+
+            # =============================================
+            # A -> B -> A joint-malfunction regime
+            # =============================================
+
+            if t == args.shift1:
+                # A -> B: reverse actuator-0 torque polarity.
+                base_env.model.actuator_gear[
+                    malfunction_actuator,
+                    0,
+                ] = -original_gear
+
+                print(
+                    f"A -> B at t={t}: "
+                    f"actuator {malfunction_actuator} gear "
+                    f"{original_gear} -> {-original_gear}"
+                )
+
+            elif t == args.shift2:
+                # B -> A: restore the original actuator gear.
+                base_env.model.actuator_gear[
+                    malfunction_actuator,
+                    0,
+                ] = original_gear
+
+                print(
+                    f"B -> A at t={t}: "
+                    f"actuator {malfunction_actuator} gear "
+                    f"{-original_gear} -> {original_gear}"
+                )
+
+            # =============================================
+            # Environment transition
+            # =============================================
+
+            (
+                next_obs,
+                reward,
+                terminated,
+                truncated,
+                info,
+            ) = env.step(sim_action)
+
+            raw_next_obs = info["raw_obs"]
+
+            detector_info = agent.update(
+                obs,
+                action,
+                next_obs,
+                reward,
+                terminated,
+                raw_obs=raw_obs,
+                raw_next_obs=raw_next_obs,
+                **action_info,
+            )
+
+            ret += reward
+            step += 1
+
+            obs = next_obs
+            raw_obs = raw_next_obs
+
+            # =============================================
+            # Checkpoint
+            # =============================================
+
+            if (
+                t % args.checkpoint == 0
+                and args.save_model
+            ):
+
+                agent.save(
+                    model_dir=args.results_dir,
+                    unique_str=(
+                        f"{run_id}"
+                        f"_model_"
+                        f"{human_format_numbers(t)}"
+                    ),
+                )
+
+            # =============================================
+            # Episode termination
+            # =============================================
+
+            if terminated or truncated:
+
+                rets.append(ret)
+                ep_steps.append(step)
+
+                print(
+                    "E: {}| D: {:.3f}| "
+                    "S: {}| R: {:.2f}| T: {}".format(
+                        len(rets),
+                        time.time() - ep_tic,
+                        step,
+                        ret,
+                        t,
+                    )
+                )
+
+                ep_tic = time.time()
+
+                obs, info = env.reset()
+                raw_obs = info["raw_obs"]
+
+                ret = 0
+                step = 0
+
+    except Exception as e:
+
+        print(e)
+
+        print(
+            "Exiting this run, storing partial "
+            "logs for debugging..."
+        )
+
+        traceback.print_exc()
+
+    # =====================================================
+    # Partial episode
+    # =====================================================
+
+    if not (terminated or truncated):
+
+        print(
+            "Appending partial episode #{}, "
+            "length: {}, Total Steps: {}".format(
+                len(rets),
+                step,
+                t + 1,
+            )
+        )
+
+        rets.append(ret)
+        ep_steps.append(step)
+
+    # =====================================================
+    # Save model
+    # =====================================================
+
+    if args.save_model:
+
+        agent.save(
+            model_dir=args.results_dir,
+            unique_str=f"{run_id}_model",
+        )
+
+    print(
+        "Run with id: {} took {:.3f}s!".format(
+            run_id,
+            time.time() - tic,
+        )
+    )
+
+    # =====================================================
+    # Eval
+    # =====================================================
+
+    if args.n_eval:
+
+        record_video(
+            env,
+            agent,
+            num_episodes=args.n_eval,
+            video_filename=(
+                f"{args.results_dir}"
+                f"/{run_id}.avi"
+            ),
+        )
+
+    return ep_steps, rets
+
+
+# =========================================================
+# Main
+# =========================================================
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument(
+        "--env",
+        default="HalfCheetah-v4",
+        type=str,
+        help="e.g., 'HalfCheetah-v4'",
+    )
+
+    parser.add_argument(
+        "--seed",
+        default=42,
+        type=int,
+        help="Seed for random number generator",
+    )
+
+    parser.add_argument(
+        "--N",
+        default=150_000,
+        type=int,
+        help="# timesteps for the run",
+    )
+
+    # =====================================================
+    # AVG parameters
+    # =====================================================
+
+    parser.add_argument(
+        "--actor_lr",
+        default=0.0063,
+        type=float,
+        help="Actor step size",
+    )
+
+    parser.add_argument(
+        "--critic_lr",
+        default=0.0087,
+        type=float,
+        help="Critic step size",
+    )
+
+    parser.add_argument(
+        "--beta1",
+        default=0.0,
+        type=float,
+        help="Beta1 parameter of Adam optimizer",
+    )
+
+    parser.add_argument(
+        "--gamma",
+        default=0.99,
+        type=float,
+        help="Discount factor",
+    )
+
+    parser.add_argument(
+        "--alpha_lr",
+        default=0.07,
+        type=float,
+        help="Entropy Coefficient for AVG",
+    )
+
+    parser.add_argument(
+        "--l2_actor",
+        default=0,
+        type=float,
+    )
+
+    parser.add_argument(
+        "--l2_critic",
+        default=0,
+        type=float,
+    )
+
+    parser.add_argument(
+        "--nhid_actor",
+        default=256,
+        type=int,
+    )
+
+    parser.add_argument(
+        "--nhid_critic",
+        default=256,
+        type=int,
+    )
+
+    # =====================================================
+    # Fast/slow predictor parameters
+    # =====================================================
+
+    parser.add_argument(
+        "--nhid_predictor",
+        default=128,
+        type=int,
+    )
+
+    parser.add_argument(
+        "--predictor_lr",
+        default=1e-4,
+        type=float,
+    )
+
+    parser.add_argument(
+        "--num_predictors",
+        default=5,
+        type=int,
+    )
+
+    parser.add_argument(
+        "--pred_logvar_min",
+        default=-10.0,
+        type=float,
+    )
+
+    parser.add_argument(
+        "--pred_logvar_max",
+        default=5.0,
+        type=float,
+    )
+
+    parser.add_argument(
+        "--slow_ema",
+        default=0.999,
+        type=float,
+        help="EMA coefficient for the slow predictive reference",
+    )
+
+    parser.add_argument(
+        "--comparison_warmup",
+        default=10_000,
+        type=int,
+        help=(
+            "Initial steps during which slow is hard-synced "
+            "to fast and block-rate detection is disabled"
+        ),
+    )
+
+    parser.add_argument(
+        "--block_size",
+        default=100,
+        type=int,
+        help=(
+            "Number of transitions aggregated into one fast-win "
+            "rate observation"
+        ),
+    )
+
+    parser.add_argument(
+        "--short_rate_beta",
+        default=0.80,
+        type=float,
+        help=(
+            "EMA coefficient for the short-timescale block win rate"
+        ),
+    )
+
+    parser.add_argument(
+        "--long_rate_beta",
+        default=0.99,
+        type=float,
+        help=(
+            "EMA coefficient for the long-timescale block win rate"
+        ),
+    )
+
+    parser.add_argument(
+        "--rate_warmup_blocks",
+        default=20,
+        type=int,
+        help=(
+            "Completed blocks used to establish short/long rate "
+            "estimates before the detector is first armed"
+        ),
+    )
+
+    parser.add_argument(
+        "--rate_gap_threshold",
+        default=0.15,
+        type=float,
+        help=(
+            "Detectable elevation in short-minus-long block fast-win rate"
+        ),
+    )
+
+    parser.add_argument(
+        "--rate_persistence_blocks",
+        default=3,
+        type=int,
+        help=(
+            "Number of consecutive completed blocks for which the "
+            "rate gap must exceed the threshold"
+        ),
+    )
+
+    parser.add_argument(
+        "--rearm_gap_threshold",
+        default=0.05,
+        type=float,
+        help=(
+            "After a detection, short and long rates must reconverge "
+            "within this absolute gap before rearming"
+        ),
+    )
+
+    parser.add_argument(
+        "--rearm_persistence_blocks",
+        default=5,
+        type=int,
+        help=(
+            "Number of consecutive settled blocks required to rearm "
+            "after a detection"
+        ),
+    )
+
+    parser.add_argument(
+        "--detector_log_interval",
+        default=100,
+        type=int,
+        help="Write detector trace every N environment steps",
+    )
+
+    parser.add_argument(
+        "--shift1",
+        default=50_000,
+        type=int,
+        help="A -> B regime-change step",
+    )
+
+    parser.add_argument(
+        "--shift2",
+        default=100_000,
+        type=int,
+        help="B -> A regime-change step",
+    )
+
+    # =====================================================
+    # Misc.
+    # =====================================================
+
+    parser.add_argument(
+        "--checkpoint",
+        default=50000,
+        type=int,
+    )
+
+    parser.add_argument(
+        "--results_dir",
+        default="./results",
+        type=str,
+    )
+
+    parser.add_argument(
+        "--device",
+        default="cpu",
+        type=str,
+    )
+
+    parser.add_argument(
+        "--save_model",
+        action="store_true",
+        default=False,
+    )
+
+    parser.add_argument(
+        "--n_eval",
+        default=0,
+        type=int,
+    )
+
+    args = parser.parse_args()
+
+    # Adam
+    args.betas = [
+        args.beta1,
+        0.999,
+    ]
+
+    # Device
+    if (
+        torch.cuda.is_available()
+        and "cuda" in args.device
+    ):
+
+        args.device = torch.device(
+            args.device
+        )
+
+    else:
+
+        args.device = torch.device(
+            "cpu"
+        )
+
+    args.algo = "AVG"
+
+    # =====================================================
+    # Run
+    # =====================================================
+
+    set_one_thread()
+
+    ep_steps, rets = main(args)
+
+    # =====================================================
+    # Save results
+    # =====================================================
+
+    os.makedirs(
+        args.results_dir,
+        exist_ok=True,
+    )
+
+    pkl_fpath = os.path.join(
+        args.results_dir,
+        (
+            f"{args.env}"
+            f"_aba_joint_fastslow_block_rate"
+            f"_seed-{args.seed}.pkl"
+        ),
+    )
+
+    with open(
+        pkl_fpath,
+        "wb",
+    ) as f:
+
+        pickle.dump(
+            (
+                ep_steps,
+                rets,
+                args.env,
+            ),
+            f,
+        )
