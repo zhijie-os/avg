@@ -418,14 +418,17 @@ class AVG:
         self.detector_delta = cfg.detector_delta
         self.detector_h = cfg.detector_h
         self.detector_h_warn = cfg.detector_h_warn
-        self.detector_warmup = cfg.detector_warmup
+
+        self.initial_detector_warmup = cfg.initial_detector_warmup
+        self.post_change_warmup = cfg.post_change_warmup
+
         self.detector_log_interval = cfg.detector_log_interval
 
-        # W_t in the paper.
+        # W_t
         self.change_score = 0.0
 
-        # During warm-up we train the ensemble but do not accumulate CUSUM.
-        self.warmup_remaining = self.detector_warmup
+        # Longer calibration only at the beginning of training.
+        self.warmup_remaining = self.initial_detector_warmup
 
         # -------------------------------------------------
         # Actor / critic optimizers
@@ -700,7 +703,7 @@ class AVG:
                 self.change_score = 0.0
 
                 # The same ensemble now adapts to the new regime.
-                self.warmup_remaining = self.detector_warmup
+                self.warmup_remaining = self.post_change_warmup
 
                 predictor_update = True
 
@@ -1369,9 +1372,17 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--detector_warmup",
-        default=1000,
+        "--initial_detector_warmup",
+        default=10_000,
         type=int,
+        help="Initial predictor calibration period before CUSUM is enabled",
+    )
+
+    parser.add_argument(
+        "--post_change_warmup",
+        default=1_000,
+        type=int,
+        help="Predictor adaptation period after a detected regime change",
     )
 
     parser.add_argument(
