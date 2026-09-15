@@ -349,13 +349,13 @@ class AVG:
 
         self.regime_log_path = os.path.join(
             cfg.results_dir,
-            f"{cfg.run_id}_regime_changes_aba_joint.log",
+            f"{cfg.run_id}_regime_changes_aba_joint_short.log",
         )
 
         # Periodic detector trace for debugging/plotting.
         self.detector_trace_path = os.path.join(
             cfg.results_dir,
-            f"{cfg.run_id}_detector_trace_aba_joint.csv",
+            f"{cfg.run_id}_detector_trace_aba_joint_short.csv",
         )
 
         with open(self.detector_trace_path, "w") as f:
@@ -1073,7 +1073,7 @@ def main(args):
             # A -> B -> A joint-malfunction regime
             # =============================================
 
-            if t == 5_000_000:
+            if t == 500_000:
                 # A -> B: reverse actuator-0 torque polarity.
                 base_env.model.actuator_gear[
                     malfunction_actuator,
@@ -1086,7 +1086,7 @@ def main(args):
                     f"{original_gear} -> {-original_gear}"
                 )
 
-            elif t == 10_000_000:
+            elif t == 1_000_000:
                 # B -> A: restore the original actuator gear.
                 base_env.model.actuator_gear[
                     malfunction_actuator,
@@ -1266,7 +1266,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--N",
-        default=15_001_000,
+        default=1_500_000,
         type=int,
         help="# timesteps for the run",
     )
@@ -1402,7 +1402,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--detector_log_interval",
-        default=1000,
+        default=100,
         type=int,
         help="Write detector trace every N environment steps",
     )
@@ -1488,7 +1488,7 @@ if __name__ == "__main__":
         args.results_dir,
         (
             f"{args.env}"
-            f"_aba_joint_detector"
+            f"_aba_joint_detector_short"
             f"_seed-{args.seed}.pkl"
         ),
     )

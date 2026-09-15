@@ -349,13 +349,13 @@ class AVG:
 
         self.regime_log_path = os.path.join(
             cfg.results_dir,
-            f"{cfg.run_id}_regime_changes_aba_joint.log",
+            f"{cfg.run_id}_regime_changes_aba_wind_short.log",
         )
 
         # Periodic detector trace for debugging/plotting.
         self.detector_trace_path = os.path.join(
             cfg.results_dir,
-            f"{cfg.run_id}_detector_trace_aba_joint.csv",
+            f"{cfg.run_id}_detector_trace_aba_wind_short.csv",
         )
 
         with open(self.detector_trace_path, "w") as f:
@@ -427,7 +427,7 @@ class AVG:
         # W_t in the paper.
         self.change_score = 0.0
 
-        # Longer calibration period only at the start of training.
+        # Longer warm-up only at the start of training.
         self.warmup_remaining = self.initial_detector_warmup
 
         # -------------------------------------------------
@@ -964,7 +964,7 @@ def main(args):
             "%Y%m%d_%H%M%S"
         )
         +
-        f"-joint"
+        f"-wind"
         f"-{args.algo}"
         f"-{args.env}"
         f"_seed-{args.seed}"
@@ -993,17 +993,10 @@ def main(args):
     base_env = env.unwrapped
 
     # =====================================================
-    # A -> B -> A joint-malfunction regime
+    # A -> B -> A wind regime
     # =====================================================
 
-    malfunction_actuator = 0
-
-    original_gear = (
-        base_env.model.actuator_gear[
-            malfunction_actuator,
-            0,
-        ].copy()
-    )
+    torso_id = base_env.model.body("torso").id
 
     # =====================================================
     # Reproducibility
@@ -1070,34 +1063,29 @@ def main(args):
             )
 
             # =============================================
-            # A -> B -> A joint-malfunction regime
+            # A -> B -> A wind regime
             # =============================================
 
-            if t == 5_000_000:
-                # A -> B: reverse actuator-0 torque polarity.
-                base_env.model.actuator_gear[
-                    malfunction_actuator,
-                    0,
-                ] = -original_gear
+            # Clear external force every step.
+            base_env.data.xfrc_applied[:] = 0.0
 
+            if t == 500_000:
                 print(
-                    f"A -> B at t={t}: "
-                    f"actuator {malfunction_actuator} gear "
-                    f"{original_gear} -> {-original_gear}"
+                    f"A -> B wind regime at t={t}: "
+                    f"torso x-force 0.0 -> -50.0"
                 )
 
-            elif t == 10_000_000:
-                # B -> A: restore the original actuator gear.
-                base_env.model.actuator_gear[
-                    malfunction_actuator,
-                    0,
-                ] = original_gear
-
+            elif t == 1_000_000:
                 print(
-                    f"B -> A at t={t}: "
-                    f"actuator {malfunction_actuator} gear "
-                    f"{-original_gear} -> {original_gear}"
+                    f"B -> A wind regime at t={t}: "
+                    f"torso x-force -50.0 -> 0.0"
                 )
+
+            if 500_000 <= t < 1_000_000:
+                base_env.data.xfrc_applied[
+                    torso_id,
+                    0,
+                ] = -50.0
 
             # =============================================
             # Environment transition
@@ -1266,7 +1254,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--N",
-        default=15_001_000,
+        default=1_500_000,
         type=int,
         help="# timesteps for the run",
     )
@@ -1402,7 +1390,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--detector_log_interval",
-        default=1000,
+        default=100,
         type=int,
         help="Write detector trace every N environment steps",
     )
@@ -1488,7 +1476,7 @@ if __name__ == "__main__":
         args.results_dir,
         (
             f"{args.env}"
-            f"_aba_joint_detector"
+            f"_aba_wind_detector_short"
             f"_seed-{args.seed}.pkl"
         ),
     )
