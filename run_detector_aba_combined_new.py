@@ -57,6 +57,30 @@ def set_one_thread():
 
 
 # =========================================================
+# Raw observation passthrough
+# =========================================================
+
+class RawObservationInfo(gym.Wrapper):
+    """
+    Preserve the flattened raw observation in info["raw_obs"] while
+    outer wrappers (e.g. NormalizeObservation) may transform the
+    observation seen by AVG.
+    """
+
+    def reset(self, **kwargs):
+        obs, info = self.env.reset(**kwargs)
+        info = dict(info)
+        info["raw_obs"] = np.asarray(obs, dtype=np.float32).copy()
+        return obs, info
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        info = dict(info)
+        info["raw_obs"] = np.asarray(obs, dtype=np.float32).copy()
+        return obs, reward, terminated, truncated, info
+
+
+# =========================================================
 # Running statistics
 # =========================================================
 
@@ -213,10 +237,12 @@ class Q(nn.Module):
 
 
 # =========================================================
-# Environment predictor
+# Probabilistic environment predictor
 #
-# F_psi(S_t, A_t)
-#     -> (S_hat_{t+1}, R_hat_{t+1})
+# p_n(S_{t+1}, R_{t+1} | S_t, A_t)
+#   = N(mu_n(S_t, A_t), Sigma_n(S_t, A_t))
+#
+# Sigma_n is diagonal and represented by a log-variance vector.
 # =========================================================
 
 class Predictor(nn.Module):
@@ -227,49 +253,76 @@ class Predictor(nn.Module):
         action_dim,
         device,
         n_hid=128,
+        logvar_min=-10.0,
+        logvar_max=5.0,
     ):
         super().__init__()
 
         self.device = device
+        self.logvar_min = logvar_min
+        self.logvar_max = logvar_max
+        self.out_dim = obs_dim + 1  # next observation + reward
 
         self.net = nn.Sequential(
             nn.Linear(obs_dim + action_dim, n_hid),
             nn.LeakyReLU(),
-
             nn.Linear(n_hid, n_hid),
             nn.LeakyReLU(),
         )
 
-        self.next_obs_head = nn.Linear(
+        self.mean_head = nn.Linear(
             n_hid,
-            obs_dim,
+            self.out_dim,
         )
 
-        self.reward_head = nn.Linear(
+        self.logvar_head = nn.Linear(
             n_hid,
-            1,
+            self.out_dim,
         )
 
         self.apply(orthogonal_weight_init)
         self.to(device)
 
-    def forward(self, obs, action):
+    def forward(self, raw_obs, action):
 
         x = torch.cat(
-            (obs, action),
+            (raw_obs, action),
             dim=-1,
         ).to(self.device)
 
         h = self.net(x)
 
-        pred_next_obs = self.next_obs_head(h)
+        mean = self.mean_head(h)
 
-        pred_reward = (
-            self.reward_head(h)
-            .squeeze(-1)
+        logvar = torch.clamp(
+            self.logvar_head(h),
+            self.logvar_min,
+            self.logvar_max,
         )
 
-        return pred_next_obs, pred_reward
+        return mean, logvar
+
+
+def diagonal_gaussian_log_prob(target, mean, var):
+    """
+    Log p(target) for a diagonal Gaussian.
+
+    target, mean, var: [batch, dimension]
+    returns: [batch]
+    """
+    var = torch.clamp(var, min=1e-8)
+
+    return -0.5 * (
+        torch.log(
+            2.0
+            * torch.pi
+            * var
+        )
+        + (
+            (target - mean) ** 2
+            / var
+        )
+    ).sum(dim=-1)
 
 
 # =========================================================
@@ -296,8 +349,22 @@ class AVG:
 
         self.regime_log_path = os.path.join(
             cfg.results_dir,
-            f"{cfg.run_id}_regime_changes.log",
+            f"{cfg.run_id}_regime_changes_aba_combined.log",
         )
+
+        # Periodic detector trace for debugging/plotting.
+        self.detector_trace_path = os.path.join(
+            cfg.results_dir,
+            f"{cfg.run_id}_detector_trace_aba_combined.csv",
+        )
+
+        with open(self.detector_trace_path, "w") as f:
+            f.write(
+                "step,L_t,W_t,log_p_hat,log_p_new,"
+                "mean_total_var,mean_epistemic_var,"
+                "warning,frozen,warmup_remaining,"
+                "regime_change,predictor_nll\n"
+            )
 
         # -------------------------------------------------
         # Actor / critic
@@ -318,42 +385,50 @@ class AVG:
         )
 
         # -------------------------------------------------
-        # Predictor
+        # Probabilistic predictor ensemble
         # -------------------------------------------------
 
-        self.predictor = Predictor(
-            obs_dim=cfg.obs_dim,
-            action_dim=cfg.action_dim,
-            device=cfg.device,
-            n_hid=cfg.nhid_predictor,
+        self.predictors = nn.ModuleList(
+            [
+                Predictor(
+                    obs_dim=cfg.obs_dim,
+                    action_dim=cfg.action_dim,
+                    device=cfg.device,
+                    n_hid=cfg.nhid_predictor,
+                    logvar_min=cfg.pred_logvar_min,
+                    logvar_max=cfg.pred_logvar_max,
+                )
+                for _ in range(cfg.num_predictors)
+            ]
         )
 
+        self.pred_opts = [
+            torch.optim.Adam(
+                predictor.parameters(),
+                lr=cfg.predictor_lr,
+            )
+            for predictor in self.predictors
+        ]
+
         # -------------------------------------------------
-        # Detector statistics
+        # Likelihood-ratio CUSUM detector
         # -------------------------------------------------
 
-        # Distribution of e_t^P and e_t^R
-        # for the currently believed regime.
-        self.pred_error_P_stats = RunningStats()
-        self.pred_error_R_stats = RunningStats()
+        self.num_predictors = cfg.num_predictors
+        self.detector_delta = cfg.detector_delta
+        self.detector_h = cfg.detector_h
+        self.detector_h_warn = cfg.detector_h_warn
+        self.detector_warmup = cfg.detector_warmup
+        self.detector_log_interval = cfg.detector_log_interval
 
-        # Used only to put reward error on a reasonable scale.
-        # This is NOT reset at a detected regime boundary.
-        self.reward_stats = RunningStats()
-
+        # W_t in the paper.
         self.change_score = 0.0
 
-        # Detector hyperparameters
-        self.detector_beta = 0.99
-        self.detector_tau = 2.0
-        self.detector_h = 3.0
-
-        self.detector_warmup = 1000
-
-        self.steps_since_change = 0
+        # During warm-up we train the ensemble but do not accumulate CUSUM.
+        self.warmup_remaining = self.detector_warmup
 
         # -------------------------------------------------
-        # Optimizers
+        # Actor / critic optimizers
         # -------------------------------------------------
 
         self.popt = torch.optim.Adam(
@@ -366,11 +441,6 @@ class AVG:
             self.Q.parameters(),
             lr=cfg.critic_lr,
             betas=cfg.betas,
-        )
-
-        self.pred_opt = torch.optim.Adam(
-            self.predictor.parameters(),
-            lr=cfg.predictor_lr,
         )
 
         # -------------------------------------------------
@@ -411,184 +481,205 @@ class AVG:
         next_obs,
         reward,
         done,
+        raw_obs,
+        raw_next_obs,
         **kwargs,
     ):
 
-        obs = torch.Tensor(
-            obs.astype(np.float32)
-        ).unsqueeze(0).to(self.device)
+        # AVG actor/critic observations remain normalized by
+        # Gymnasium's NormalizeObservation wrapper.
+        obs = torch.tensor(
+            obs.astype(np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
 
-        next_obs = torch.Tensor(
-            next_obs.astype(np.float32)
-        ).unsqueeze(0).to(self.device)
+        next_obs = torch.tensor(
+            next_obs.astype(np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
+
+        # The detector gets RAW flattened environment observations.
+        raw_obs = torch.tensor(
+            raw_obs.astype(np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
+
+        raw_next_obs = torch.tensor(
+            raw_next_obs.astype(np.float32),
+            dtype=torch.float32,
+            device=self.device,
+        ).unsqueeze(0)
 
         action = action.to(self.device)
+        detector_action = action.detach()
 
         lprob = kwargs["lprob"]
 
         reward_tensor = torch.tensor(
-            [reward],
+            [[reward]],
             dtype=torch.float32,
             device=self.device,
         )
 
-        # =================================================
-        # 1. Predictor forward pass
-        #
-        # IMPORTANT:
-        # prediction happens BEFORE updating predictor.
-        # =================================================
-
-        pred_next_obs, pred_reward = self.predictor(
-            obs,
-            action.detach(),
-        )
-
-        # =================================================
-        # 2. Prediction errors
-        # =================================================
-
-        # The environment already uses NormalizeObservation,
-        # therefore next_obs is already normalized.
-        #
-        # e_t^P =
-        # 1 / sqrt(d) * ||S_{t+1} - S_hat_{t+1}||_2
-        #
-        # which is RMSE across observation dimensions.
-
-        e_P = torch.sqrt(
-            torch.mean(
-                (
-                    next_obs
-                    - pred_next_obs.detach()
-                ) ** 2
-            )
-        ).item()
-
-        # Reward scale from PREVIOUS rewards only.
-        reward_scale = max(
-            self.reward_stats.std,
-            1e-3,
-        )
-
-        # e_t^R
-        e_R = torch.abs(
+        # Joint detector target:
+        # [S_{t+1}, R_{t+1}]
+        detector_target = torch.cat(
             (
-                reward_tensor
-                - pred_reward.detach()
+                raw_next_obs,
+                reward_tensor,
+            ),
+            dim=-1,
+        )
+
+        # =================================================
+        # 1. Score the transition BEFORE training on it
+        # =================================================
+
+        predictor_outputs = []
+
+        for predictor in self.predictors:
+            mean_n, logvar_n = predictor(
+                raw_obs,
+                detector_action,
             )
-            / (reward_scale + 1e-8)
-        ).mean().item()
+
+            var_n = torch.exp(logvar_n)
+
+            predictor_outputs.append(
+                (
+                    mean_n,
+                    logvar_n,
+                    var_n,
+                )
+            )
+
+        with torch.no_grad():
+
+            means = torch.stack(
+                [
+                    output[0].detach()
+                    for output in predictor_outputs
+                ],
+                dim=0,
+            )
+
+            variances = torch.stack(
+                [
+                    output[2].detach()
+                    for output in predictor_outputs
+                ],
+                dim=0,
+            )
+
+            # Ensemble mean:
+            # mu_* = 1/N sum_n mu_n
+            mu_star = means.mean(dim=0)
+
+            # Total ensemble covariance diagonal:
+            # E[var_n + mu_n^2] - E[mu_n]^2
+            var_star = (
+                (
+                    variances
+                    + means.pow(2)
+                ).mean(dim=0)
+                - mu_star.pow(2)
+            )
+
+            var_star = torch.clamp(
+                var_star,
+                min=1e-8,
+            )
+
+            # Pure between-model disagreement, useful for debugging.
+            epistemic_var = (
+                (
+                    means
+                    - mu_star.unsqueeze(0)
+                ).pow(2)
+            ).mean(dim=0)
+
+            log_p_hat = diagonal_gaussian_log_prob(
+                detector_target,
+                mu_star,
+                var_star,
+            )
+
+            # -------------------------------------------------
+            # Alternative distribution p_new
+            #
+            # This matches the CURRENT DRAFT literally:
+            #
+            # mu_new =
+            #   [S_{t+1}, R_{t+1}]
+            #   + delta * diag(Sigma_*)
+            #
+            # Since var_star stores diag(Sigma_*), use var_star.
+            # If we later decide delta is explicitly measured in
+            # standard deviations, change this ONE line to:
+            #
+            # mu_new = detector_target + delta * sqrt(var_star)
+            # -------------------------------------------------
+
+            mu_new = (
+                detector_target
+                + self.detector_delta
+                * var_star
+            )
+
+            log_p_new = diagonal_gaussian_log_prob(
+                detector_target,
+                mu_new,
+                var_star,
+            )
+
+            L_t = (
+                log_p_new
+                - log_p_hat
+            ).item()
+
+            log_p_hat_value = log_p_hat.item()
+            log_p_new_value = log_p_new.item()
+
+            mean_total_var = var_star.mean().item()
+            mean_epistemic_var = epistemic_var.mean().item()
 
         # =================================================
-        # 3. Regime detector
+        # 2. Likelihood-ratio CUSUM
         # =================================================
 
-        # Defaults during warmup
-        e_P_bar = 0.0
-        e_R_bar = 0.0
-
-        D_t = 0.0
         regime_change = False
+        warning = False
+        freeze_predictors = False
 
-        # -------------------------------------------------
-        # Warmup / calibration period
-        # -------------------------------------------------
+        # Keep this for logging if W is reset on detection.
+        W_for_log = self.change_score
 
-        if (
-            self.steps_since_change
-            < self.detector_warmup
-        ):
+        if self.warmup_remaining > 0:
 
-            self.pred_error_P_stats.update(e_P)
-            self.pred_error_R_stats.update(e_R)
+            # Calibration/adaptation period. We deliberately do
+            # not accumulate change evidence here.
+            self.warmup_remaining -= 1
 
-        # -------------------------------------------------
-        # Normal detector operation
-        # -------------------------------------------------
+            predictor_update = True
+
+            W_for_log = self.change_score
 
         else:
 
-            # Standardized transition prediction error
-            e_P_bar = (
-                e_P
-                - self.pred_error_P_stats.mean
-            ) / (
-                self.pred_error_P_stats.std
-                + 1e-8
+            self.change_score = max(
+                0.0,
+                self.change_score + L_t,
             )
 
-            # Standardized reward prediction error
-            e_R_bar = (
-                e_R
-                - self.pred_error_R_stats.mean
-            ) / (
-                self.pred_error_R_stats.std
-                + 1e-8
-            )
+            W_for_log = self.change_score
 
-            # ---------------------------------------------
-            # Instantaneous surprise
-            #
-            # D_t = 1/2 [
-            #   max(0, e_P_bar)^2
-            #   +
-            #   max(0, e_R_bar)^2
-            # ]
-            # ---------------------------------------------
+            if self.change_score > self.detector_h:
 
-            D_t = 0.5 * (
-                max(
-                    0.0,
-                    e_P_bar,
-                ) ** 2
-                +
-                max(
-                    0.0,
-                    e_R_bar,
-                ) ** 2
-            )
+                regime_change = True
 
-            # ---------------------------------------------
-            # Persistent surprise
-            #
-            # c_t =
-            # beta c_{t-1}
-            # +
-            # (1-beta) max(0, D_t - tau)
-            # ---------------------------------------------
-
-            self.change_score = (
-                self.detector_beta
-                * self.change_score
-                +
-                (
-                    1.0
-                    - self.detector_beta
-                )
-                * max(
-                    0.0,
-                    D_t
-                    - self.detector_tau,
-                )
-            )
-
-            # ---------------------------------------------
-            # Detect regime boundary
-            # ---------------------------------------------
-
-            regime_change = (
-                self.change_score
-                > self.detector_h
-            )
-
-            # ---------------------------------------------
-            # Regime change detected
-            # ---------------------------------------------
-
-            if regime_change:
-
-                # Write BEFORE resetting c_t.
                 with open(
                     self.regime_log_path,
                     "a",
@@ -596,86 +687,116 @@ class AVG:
 
                     f.write(
                         f"step={self.steps}, "
-                        f"D_t={D_t:.6f}, "
-                        f"c_t={self.change_score:.6f}, "
-                        f"e_P={e_P:.6f}, "
-                        f"e_R={e_R:.6f}, "
-                        f"e_P_bar={e_P_bar:.6f}, "
-                        f"e_R_bar={e_R_bar:.6f}\n"
+                        f"L_t={L_t:.6f}, "
+                        f"W_t={self.change_score:.6f}, "
+                        f"log_p_hat={log_p_hat_value:.6f}, "
+                        f"log_p_new={log_p_new_value:.6f}, "
+                        f"mean_total_var={mean_total_var:.6f}, "
+                        f"mean_epistemic_var="
+                        f"{mean_epistemic_var:.6f}\n"
                     )
 
-                # Reset error reference distribution.
-                self.pred_error_P_stats.reset()
-                self.pred_error_R_stats.reset()
-
-                # Reset persistent surprise.
+                # Reset detector state, NOT predictor weights.
                 self.change_score = 0.0
 
-                # Start calibration for new regime.
-                self.steps_since_change = 0
+                # The same ensemble now adapts to the new regime.
+                self.warmup_remaining = self.detector_warmup
 
-            # ---------------------------------------------
-            # Normal-looking sample
-            #
-            # Only update reference statistics when the
-            # transition is not currently suspicious.
-            # ---------------------------------------------
+                predictor_update = True
 
-            elif D_t <= self.detector_tau:
+            elif (
+                self.change_score
+                >= self.detector_h_warn
+            ):
 
-                self.pred_error_P_stats.update(e_P)
-                self.pred_error_R_stats.update(e_R)
+                # Suspicious region: freeze ALL predictor weights
+                # so the reference model cannot learn away the
+                # evidence before W crosses h.
+                warning = True
+                freeze_predictors = True
+                predictor_update = False
 
-            # If:
-            #
-            # D_t > tau
-            # but
-            # c_t <= h
-            #
-            # we do NOT update the reference statistics.
-            # This prevents suspicious samples from
-            # immediately contaminating the baseline.
+            else:
+
+                predictor_update = True
 
         # =================================================
-        # 4. Train predictor
+        # 3. Online Poisson bootstrap predictor update
         # =================================================
 
-        state_pred_loss = torch.mean(
-            (
-                next_obs
-                - pred_next_obs
-            ) ** 2
-        )
+        predictor_nll_values = []
 
-        reward_pred_loss = torch.mean(
-            (
-                (
-                    reward_tensor
-                    - pred_reward
+        if predictor_update:
+
+            for n, (
+                mean_n,
+                logvar_n,
+                var_n,
+            ) in enumerate(predictor_outputs):
+
+                # One streaming transition, one possible optimizer
+                # update for this predictor. k=0 means this bootstrap
+                # member skips the sample. k>0 weights the NLL.
+                k_n_t = np.random.poisson(1.0)
+
+                if k_n_t == 0:
+                    continue
+
+                log_prob_n = diagonal_gaussian_log_prob(
+                    detector_target,
+                    mean_n,
+                    var_n,
                 )
-                / (
-                    reward_scale
-                    + 1e-8
+
+                nll_n = -log_prob_n.mean()
+
+                loss_n = (
+                    float(k_n_t)
+                    * nll_n
                 )
-            ) ** 2
-        )
 
-        pred_loss = (
-            state_pred_loss
-            + reward_pred_loss
-        )
+                self.pred_opts[n].zero_grad()
 
-        self.pred_opt.zero_grad()
+                loss_n.backward()
 
-        pred_loss.backward()
+                self.pred_opts[n].step()
 
-        self.pred_opt.step()
+                predictor_nll_values.append(
+                    nll_n.detach().item()
+                )
 
-        # Reward normalization statistics are updated only
-        # AFTER calculating this transition's surprise.
-        self.reward_stats.update(reward)
+        if predictor_nll_values:
+            predictor_nll = float(
+                np.mean(predictor_nll_values)
+            )
+        else:
+            predictor_nll = float("nan")
 
-        self.steps_since_change += 1
+        # =================================================
+        # 4. Detector logging
+        # =================================================
+
+        if self.steps % self.detector_log_interval == 0:
+
+            with open(
+                self.detector_trace_path,
+                "a",
+            ) as f:
+
+                f.write(
+                    f"{self.steps},"
+                    f"{L_t:.8f},"
+                    f"{W_for_log:.8f},"
+                    f"{log_p_hat_value:.8f},"
+                    f"{log_p_new_value:.8f},"
+                    f"{mean_total_var:.8f},"
+                    f"{mean_epistemic_var:.8f},"
+                    f"{int(warning)},"
+                    f"{int(freeze_predictors)},"
+                    f"{self.warmup_remaining},"
+                    f"{int(regime_change)},"
+                    f"{predictor_nll:.8f}\n"
+                )
 
         # =================================================
         # 5. Original AVG update
@@ -774,17 +895,18 @@ class AVG:
 
         self.steps += 1
 
-        # Useful if you later want to save / plot
-        # detector signals.
         return {
-            "e_P": e_P,
-            "e_R": e_R,
-            "e_P_bar": e_P_bar,
-            "e_R_bar": e_R_bar,
-            "D_t": D_t,
-            "c_t": self.change_score,
+            "L_t": L_t,
+            "W_t": W_for_log,
+            "log_p_hat": log_p_hat_value,
+            "log_p_new": log_p_new_value,
+            "mean_total_var": mean_total_var,
+            "mean_epistemic_var": mean_epistemic_var,
+            "warning": warning,
+            "predictors_frozen": freeze_predictors,
+            "warmup_remaining": self.warmup_remaining,
             "regime_change": regime_change,
-            "predictor_loss": pred_loss.detach().item(),
+            "predictor_nll": predictor_nll,
         }
 
 
@@ -798,11 +920,18 @@ class AVG:
             "actor": self.actor.state_dict(),
             "critic": self.Q.state_dict(),
 
-            "predictor": self.predictor.state_dict(),
+            "predictors": [
+                predictor.state_dict()
+                for predictor in self.predictors
+            ],
 
             "policy_opt": self.popt.state_dict(),
             "critic_opt": self.qopt.state_dict(),
-            "predictor_opt": self.pred_opt.state_dict(),
+
+            "predictor_opts": [
+                opt.state_dict()
+                for opt in self.pred_opts
+            ],
         }
 
         torch.save(
@@ -827,6 +956,7 @@ def main(args):
             "%Y%m%d_%H%M%S"
         )
         +
+        f"-combined"
         f"-{args.algo}"
         f"-{args.env}"
         f"_seed-{args.seed}"
@@ -844,6 +974,10 @@ def main(args):
 
     env = gym.wrappers.FlattenObservation(env)
 
+    # Preserve raw flattened observations for the detector.
+    env = RawObservationInfo(env)
+
+    # AVG still receives its usual normalized observations.
     env = NormalizeObservation(env)
 
     env = ClipAction(env)
@@ -877,8 +1011,6 @@ def main(args):
     # =====================================================
     # Reproducibility
     # =====================================================
-
-    env.reset(seed=args.seed)
 
     env.action_space.seed(args.seed)
 
@@ -916,7 +1048,8 @@ def main(args):
     terminated = False
     truncated = False
 
-    obs, _ = env.reset()
+    obs, info = env.reset(seed=args.seed)
+    raw_obs = info["raw_obs"]
 
     ep_tic = time.time()
 
@@ -1014,8 +1147,10 @@ def main(args):
                 reward,
                 terminated,
                 truncated,
-                _,
+                info,
             ) = env.step(sim_action)
+
+            raw_next_obs = info["raw_obs"]
 
             detector_info = agent.update(
                 obs,
@@ -1023,6 +1158,8 @@ def main(args):
                 next_obs,
                 reward,
                 terminated,
+                raw_obs=raw_obs,
+                raw_next_obs=raw_next_obs,
                 **action_info,
             )
 
@@ -1030,6 +1167,7 @@ def main(args):
             step += 1
 
             obs = next_obs
+            raw_obs = raw_next_obs
 
             # =============================================
             # Checkpoint
@@ -1071,7 +1209,8 @@ def main(args):
 
                 ep_tic = time.time()
 
-                obs, _ = env.reset()
+                obs, info = env.reset()
+                raw_obs = info["raw_obs"]
 
                 ret = 0
                 step = 0
@@ -1248,6 +1387,55 @@ if __name__ == "__main__":
         "--predictor_lr",
         default=1e-4,
         type=float,
+    )
+
+    parser.add_argument(
+        "--num_predictors",
+        default=5,
+        type=int,
+    )
+
+    parser.add_argument(
+        "--pred_logvar_min",
+        default=-10.0,
+        type=float,
+    )
+
+    parser.add_argument(
+        "--pred_logvar_max",
+        default=5.0,
+        type=float,
+    )
+
+    parser.add_argument(
+        "--detector_delta",
+        default=2.0,
+        type=float,
+    )
+
+    parser.add_argument(
+        "--detector_h",
+        default=100.0,
+        type=float,
+    )
+
+    parser.add_argument(
+        "--detector_h_warn",
+        default=50.0,
+        type=float,
+    )
+
+    parser.add_argument(
+        "--detector_warmup",
+        default=1000,
+        type=int,
+    )
+
+    parser.add_argument(
+        "--detector_log_interval",
+        default=1000,
+        type=int,
+        help="Write detector trace every N environment steps",
     )
 
     # =====================================================
