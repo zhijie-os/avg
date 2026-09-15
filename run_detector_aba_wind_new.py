@@ -643,9 +643,10 @@ class AVG:
                 - log_p_hat
             ).item()
 
-            L_t = min(
+            L_t = np.clip(
                 L_t_raw,
-                20,
+                -5.0,
+                5.0,
             )
 
             log_p_hat_value = log_p_hat.item()
