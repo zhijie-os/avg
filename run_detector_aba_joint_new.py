@@ -638,10 +638,15 @@ class AVG:
                 var_star,
             )
 
-            L_t = (
+            L_t_raw = (
                 log_p_new
                 - log_p_hat
             ).item()
+
+            L_t = min(
+                L_t_raw,
+                20,
+            )
 
             log_p_hat_value = log_p_hat.item()
             log_p_new_value = log_p_new.item()

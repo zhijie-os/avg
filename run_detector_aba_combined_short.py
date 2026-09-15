@@ -349,13 +349,13 @@ class AVG:
 
         self.regime_log_path = os.path.join(
             cfg.results_dir,
-            f"{cfg.run_id}_regime_changes_aba_control.log",
+            f"{cfg.run_id}_regime_changes_aba_combined_short.log",
         )
 
         # Periodic detector trace for debugging/plotting.
         self.detector_trace_path = os.path.join(
             cfg.results_dir,
-            f"{cfg.run_id}_detector_trace_aba_control.csv",
+            f"{cfg.run_id}_detector_trace_aba_combined_short.csv",
         )
 
         with open(self.detector_trace_path, "w") as f:
@@ -419,17 +419,18 @@ class AVG:
         self.detector_h = cfg.detector_h
         self.detector_h_warn = cfg.detector_h_warn
 
+
         self.initial_detector_warmup = cfg.initial_detector_warmup
         self.post_change_warmup = cfg.post_change_warmup
 
         self.detector_log_interval = cfg.detector_log_interval
 
-        # W_t
+        # W_t in the paper.
         self.change_score = 0.0
 
-        # Longer calibration only at the beginning of training.
+        # During warm-up we train the ensemble but do not accumulate CUSUM.
         self.warmup_remaining = self.initial_detector_warmup
-
+        self.detector_l_max = cfg.detector_l_max
         # -------------------------------------------------
         # Actor / critic optimizers
         # -------------------------------------------------
@@ -964,7 +965,7 @@ def main(args):
             "%Y%m%d_%H%M%S"
         )
         +
-        f"-control"
+        f"-combined"
         f"-{args.algo}"
         f"-{args.env}"
         f"_seed-{args.seed}"
@@ -993,11 +994,27 @@ def main(args):
     base_env = env.unwrapped
 
     # =====================================================
-    # A -> B -> A control-cost reward regime
+    # A -> B -> A combined regime
     # =====================================================
 
+    # Control-cost reward
     original_ctrl_cost_weight = (
         base_env._ctrl_cost_weight
+    )
+
+    # Joint malfunction
+    malfunction_actuator = 0
+
+    original_gear = (
+        base_env.model.actuator_gear[
+            malfunction_actuator,
+            0,
+        ].copy()
+    )
+
+    # Wind
+    torso_id = (
+        base_env.model.body("torso").id
     )
 
     # =====================================================
@@ -1065,29 +1082,70 @@ def main(args):
             )
 
             # =============================================
-            # A -> B -> A control-cost reward regime
+            # A -> B -> A combined regime
             # =============================================
 
-            if t == 5_000_000:
+            # Always clear external forces first.
+            base_env.data.xfrc_applied[:] = 0.0
+
+            # ---------------------------------------------
+            # A -> B
+            # ---------------------------------------------
+
+            if t == 500_000:
+
+                # 1. Reward change:
+                # increase control-cost penalty
                 base_env._ctrl_cost_weight = 1.0
 
+                # 2. Dynamics change:
+                # reverse actuator 0 torque polarity
+                base_env.model.actuator_gear[
+                    malfunction_actuator,
+                    0,
+                ] = -original_gear
+
                 print(
-                    f"A -> B at t={t}: "
-                    f"ctrl_cost_weight "
-                    f"{original_ctrl_cost_weight} -> "
-                    f"{base_env._ctrl_cost_weight}"
+                    f"A -> B combined regime "
+                    f"at t={t}"
                 )
 
-            elif t == 10_000_000:
+            # ---------------------------------------------
+            # B -> A
+            # ---------------------------------------------
+
+            elif t == 1_000_000:
+
+                # Restore reward
                 base_env._ctrl_cost_weight = (
                     original_ctrl_cost_weight
                 )
 
+                # Restore dynamics
+                base_env.model.actuator_gear[
+                    malfunction_actuator,
+                    0,
+                ] = original_gear
+
                 print(
-                    f"B -> A at t={t}: "
-                    f"ctrl_cost_weight 1.0 -> "
-                    f"{base_env._ctrl_cost_weight}"
+                    f"B -> A combined regime "
+                    f"at t={t}"
                 )
+
+            # ---------------------------------------------
+            # Wind only in B
+            # ---------------------------------------------
+
+            if (
+                500_000
+                <= t
+                < 1_000_000
+            ):
+
+                base_env.data.xfrc_applied[
+                    torso_id,
+                    0,
+                ] = -50.0
 
             # =============================================
             # Environment transition
@@ -1256,7 +1314,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--N",
-        default=15_001_000,
+        default=1_500_000,
         type=int,
         help="# timesteps for the run",
     )
@@ -1392,9 +1450,16 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--detector_log_interval",
-        default=1000,
+        default=100,
         type=int,
         help="Write detector trace every N environment steps",
+    )
+
+    parser.add_argument(
+        "--detector_l_max",
+        default=20.0,
+        type=float,
+        help="Maximum positive likelihood-ratio contribution to CUSUM",
     )
 
     # =====================================================
@@ -1478,7 +1543,7 @@ if __name__ == "__main__":
         args.results_dir,
         (
             f"{args.env}"
-            f"_aba_control_detector"
+            f"_aba_combined_detector_short"
             f"_seed-{args.seed}.pkl"
         ),
     )

@@ -349,13 +349,13 @@ class AVG:
 
         self.regime_log_path = os.path.join(
             cfg.results_dir,
-            f"{cfg.run_id}_regime_changes_aba_control.log",
+            f"{cfg.run_id}_regime_changes_aba_control_short.log",
         )
 
         # Periodic detector trace for debugging/plotting.
         self.detector_trace_path = os.path.join(
             cfg.results_dir,
-            f"{cfg.run_id}_detector_trace_aba_control.csv",
+            f"{cfg.run_id}_detector_trace_aba_control_short.csv",
         )
 
         with open(self.detector_trace_path, "w") as f:
@@ -645,7 +645,7 @@ class AVG:
 
             L_t = min(
                 L_t_raw,
-                5,
+                20,
             )
 
             log_p_hat_value = log_p_hat.item()
@@ -1068,7 +1068,7 @@ def main(args):
             # A -> B -> A control-cost reward regime
             # =============================================
 
-            if t == 5_000_000:
+            if t == 500_000:
                 base_env._ctrl_cost_weight = 1.0
 
                 print(
@@ -1078,7 +1078,7 @@ def main(args):
                     f"{base_env._ctrl_cost_weight}"
                 )
 
-            elif t == 10_000_000:
+            elif t == 1_000_000:
                 base_env._ctrl_cost_weight = (
                     original_ctrl_cost_weight
                 )
@@ -1256,7 +1256,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--N",
-        default=15_001_000,
+        default=1_500_000,
         type=int,
         help="# timesteps for the run",
     )
@@ -1392,7 +1392,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--detector_log_interval",
-        default=1000,
+        default=100,
         type=int,
         help="Write detector trace every N environment steps",
     )
@@ -1478,7 +1478,7 @@ if __name__ == "__main__":
         args.results_dir,
         (
             f"{args.env}"
-            f"_aba_control_detector"
+            f"_aba_control_detector_short"
             f"_seed-{args.seed}.pkl"
         ),
     )
