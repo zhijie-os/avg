@@ -1,0 +1,15 @@
+step,event,suspicion_step,phase,validation_score,threshold,validation_streak,validation_blocks,forward_null_n,forward_null_mean,forward_null_std
+50499,START,50499,adapt,nan,nan,0,0,0,nan,nan
+50799,VALIDATE_START,50499,validate,nan,nan,0,0,0,nan,nan
+50999,VALIDATION,50499,validate,1.47974753,0.50000000,1,1,0,nan,nan
+50999,ADAPT_RESTART,50499,adapt,nan,nan,1,1,0,nan,nan
+51299,VALIDATE_START,50499,validate,nan,nan,1,1,0,nan,nan
+51499,VALIDATION,50499,validate,1.58745831,0.50000000,2,2,0,nan,nan
+51499,CONFIRM,50499,validate,1.58745831,0.50000000,2,2,0,nan,nan
+55399,START,55399,adapt,nan,nan,0,0,0,nan,nan
+55699,VALIDATE_START,55399,validate,nan,nan,0,0,0,nan,nan
+55899,VALIDATION,55399,validate,0.91507147,0.50000000,1,1,0,nan,nan
+55899,ADAPT_RESTART,55399,adapt,nan,nan,1,1,0,nan,nan
+56199,VALIDATE_START,55399,validate,nan,nan,1,1,0,nan,nan
+56399,VALIDATION,55399,validate,7.44938828,0.50000000,2,2,0,nan,nan
+56399,CONFIRM,55399,validate,7.44938828,0.50000000,2,2,0,nan,nan

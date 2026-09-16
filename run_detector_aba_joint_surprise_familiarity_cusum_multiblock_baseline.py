@@ -17,7 +17,6 @@ from incremental_rl.experiment_tracker import record_video
 from incremental_rl.td_error_scaler import TDErrorScaler
 
 
-import copy
 
 # =========================================================
 # Utilities
@@ -118,6 +117,223 @@ class RunningStats:
         variance = self.M2 / (self.n - 1)
 
         return max(variance, 1e-8) ** 0.5
+
+
+# =========================================================
+# Fixed-memory state-action familiarity
+# =========================================================
+
+class StateActionFamiliarityTracker:
+    """
+    Fixed-memory approximate visitation counts for x_t = [S_t, A_t].
+
+    A small Euclidean-LSH sketch maps every continuous state-action pair
+    into one bucket per table. The number of buckets is fixed, so memory
+    does not grow with stream length.
+
+    The first norm_warmup_steps inputs are used only to estimate a frozen
+    mean/std. Thereafter, familiarity is queried BEFORE incrementing the
+    current buckets:
+
+        F_t = 1 - exp(-c_t / count_scale),
+
+    where c_t is the median pseudo-count across independent tables.
+    """
+
+    def __init__(
+        self,
+        dim,
+        seed,
+        norm_warmup_steps=10_000,
+        num_tables=4,
+        projections_per_table=4,
+        num_buckets=4096,
+        hash_width=1.0,
+        count_scale=10.0,
+        input_clip=5.0,
+    ):
+        self.dim = int(dim)
+        self.norm_warmup_steps = int(norm_warmup_steps)
+        self.num_tables = int(num_tables)
+        self.projections_per_table = int(projections_per_table)
+        self.num_buckets = int(num_buckets)
+        self.hash_width = float(hash_width)
+        self.count_scale = float(count_scale)
+        self.input_clip = float(input_clip)
+
+        if self.dim <= 0:
+            raise ValueError("Require familiarity dim > 0")
+        if self.norm_warmup_steps < 1:
+            raise ValueError("Require familiarity_norm_warmup >= 1")
+        if self.num_tables < 1 or self.projections_per_table < 1:
+            raise ValueError("Require positive LSH table/projection counts")
+        if self.num_buckets < 2:
+            raise ValueError("Require familiarity_num_buckets >= 2")
+        if self.hash_width <= 0.0:
+            raise ValueError("Require familiarity_hash_width > 0")
+        if self.count_scale <= 0.0:
+            raise ValueError("Require familiarity_count_scale > 0")
+        if self.input_clip <= 0.0:
+            raise ValueError("Require familiarity_input_clip > 0")
+
+        rng = np.random.RandomState(int(seed))
+
+        self.projections = rng.normal(
+            size=(
+                self.num_tables,
+                self.projections_per_table,
+                self.dim,
+            )
+        ).astype(np.float64)
+
+        norms = np.linalg.norm(
+            self.projections,
+            axis=-1,
+            keepdims=True,
+        )
+        self.projections /= np.maximum(norms, 1e-12)
+
+        self.offsets = rng.uniform(
+            0.0,
+            self.hash_width,
+            size=(self.num_tables, self.projections_per_table),
+        ).astype(np.float64)
+
+        # Fixed coefficients for stable bucket mixing.
+        self.mix_coeffs = rng.randint(
+            1,
+            2**31 - 1,
+            size=(self.num_tables, self.projections_per_table),
+            dtype=np.int64,
+        )
+
+        self.counts = np.zeros(
+            (self.num_tables, self.num_buckets),
+            dtype=np.uint32,
+        )
+
+        self.norm_count = 0
+        self.norm_mean = np.zeros(self.dim, dtype=np.float64)
+        self.norm_M2 = np.zeros(self.dim, dtype=np.float64)
+        self.frozen_mean = None
+        self.frozen_std = None
+
+    @property
+    def ready(self):
+        return self.frozen_mean is not None
+
+    @property
+    def warmup_remaining(self):
+        return max(0, self.norm_warmup_steps - self.norm_count)
+
+    def _update_normalizer(self, x):
+        self.norm_count += 1
+
+        delta = x - self.norm_mean
+        self.norm_mean += delta / self.norm_count
+        delta2 = x - self.norm_mean
+        self.norm_M2 += delta * delta2
+
+        if self.norm_count == self.norm_warmup_steps:
+            if self.norm_count > 1:
+                var = self.norm_M2 / (self.norm_count - 1)
+            else:
+                var = np.ones(self.dim, dtype=np.float64)
+
+            self.frozen_mean = self.norm_mean.copy()
+            self.frozen_std = np.sqrt(np.maximum(var, 1e-6))
+
+    def _standardize(self, x):
+        z = (x - self.frozen_mean) / self.frozen_std
+        return np.clip(z, -self.input_clip, self.input_clip)
+
+    def _bucket_indices(self, z):
+        projected = np.einsum(
+            'tpd,d->tp',
+            self.projections,
+            z,
+        )
+
+        cells = np.floor(
+            (projected + self.offsets) / self.hash_width
+        ).astype(np.int64)
+
+        buckets = []
+        for table_idx in range(self.num_tables):
+            # Stable integer mixing; no Python hash/randomization involved.
+            mixed = np.int64(1469598103934665603 & 0x7FFFFFFFFFFFFFFF)
+            for projection_idx in range(self.projections_per_table):
+                term = (
+                    cells[table_idx, projection_idx]
+                    * self.mix_coeffs[table_idx, projection_idx]
+                )
+                mixed ^= np.int64(term)
+                mixed = np.int64(
+                    (int(mixed) * 1099511628211)
+                    & 0x7FFFFFFFFFFFFFFF
+                )
+
+            buckets.append(int(mixed % self.num_buckets))
+
+        return buckets
+
+    def observe(self, x):
+        """
+        Return (pseudo_count, familiarity, ready).
+        Query happens before the current x increments its buckets.
+        """
+        x = np.asarray(x, dtype=np.float64).reshape(-1)
+
+        if x.shape[0] != self.dim:
+            raise ValueError(
+                f"Expected state-action dimension {self.dim}, got {x.shape[0]}"
+            )
+
+        if not self.ready:
+            self._update_normalizer(x)
+            return 0, 0.0, self.ready
+
+        z = self._standardize(x)
+        buckets = self._bucket_indices(z)
+
+        table_counts = [
+            int(self.counts[t, bucket])
+            for t, bucket in enumerate(buckets)
+        ]
+
+        pseudo_count = int(np.median(table_counts))
+
+        familiarity = float(
+            1.0
+            - np.exp(
+                -float(pseudo_count)
+                / self.count_scale
+            )
+        )
+
+        max_uint32 = np.iinfo(np.uint32).max
+        for table_idx, bucket in enumerate(buckets):
+            if self.counts[table_idx, bucket] < max_uint32:
+                self.counts[table_idx, bucket] += 1
+
+        return pseudo_count, familiarity, True
+
+    def reset_counts(self):
+        """
+        Forget state-action familiarity from the previous regime while
+        preserving the fixed LSH projections and frozen normalization.
+        """
+        self.counts.fill(0)
+
+    def state_dict(self):
+        return {
+            "norm_count": self.norm_count,
+            "norm_mean": self.norm_mean,
+            "norm_M2": self.norm_M2,
+            "frozen_mean": self.frozen_mean,
+            "frozen_std": self.frozen_std,
+            "counts": self.counts,
+        }
 
 
 # =========================================================
@@ -351,21 +567,33 @@ class AVG:
 
         self.regime_log_path = os.path.join(
             cfg.results_dir,
-            f"{cfg.run_id}_regime_changes_aba_joint_short.log",
+            f"{cfg.run_id}_regime_changes_aba_joint_surprise_familiarity.log",
         )
 
-        # Periodic detector trace for debugging/plotting.
         self.detector_trace_path = os.path.join(
             cfg.results_dir,
-            f"{cfg.run_id}_detector_trace_aba_joint_short.csv",
+            f"{cfg.run_id}_surprise_familiarity_trace_aba_joint.csv",
+        )
+
+        self.detector_block_path = os.path.join(
+            cfg.results_dir,
+            f"{cfg.run_id}_surprise_familiarity_blocks_aba_joint.csv",
         )
 
         with open(self.detector_trace_path, "w") as f:
             f.write(
-                "step,L_t,W_t,log_p_hat,log_p_new,"
-                "mean_total_var,mean_epistemic_var,"
-                "warning,frozen,warmup_remaining,"
-                "regime_change,predictor_nll\n"
+                "step,surprise_raw,surprise_clipped,"
+                "state_action_pseudo_count,familiarity,e_t,"
+                "block_E_k,W_k,block_completed,warmup_remaining,"
+                "regime_change,mean_total_var,mean_epistemic_var,"
+                "predictor_nll\n"
+            )
+
+        with open(self.detector_block_path, "w") as f:
+            f.write(
+                "block_index,step,E_k,W_k,"
+                "mean_familiarity,mean_surprise,"
+                "regime_change\n"
             )
 
         # -------------------------------------------------
@@ -412,25 +640,82 @@ class AVG:
             for predictor in self.predictors
         ]
 
+        self.num_predictors = cfg.num_predictors
+
         # -------------------------------------------------
-        # Likelihood-ratio CUSUM detector
+        # Simple surprise / familiarity block CUSUM
+        #
+        # Transition evidence:
+        #   s_t = mean_j (y_j - mu_j)^2 / var_j
+        #   e_t = clip(s_t, 0, s_max) * F_t^gamma
+        #
+        # Block evidence:
+        #   E_k = (1/B) sum_{t in block k} e_t
+        #
+        # Familiarity-gated surprise residual CUSUM:
+        #   G_k = (1/B) sum_t F_t^gamma * (s_t - mu_s - delta)
+        #   W_k = max(0, W_{k-1} + G_k)
+        #
+        # Predictors ALWAYS keep learning. There is no fast/slow pair
+        # and no warning freeze. Low-familiarity inputs are suppressed
+        # by F_t^gamma while still training the predictor normally.
         # -------------------------------------------------
 
-        self.num_predictors = cfg.num_predictors
-        self.detector_delta = cfg.detector_delta
         self.detector_h = cfg.detector_h
-        self.detector_h_warn = cfg.detector_h_warn
+
+        # -------------------------------------------------
+        # Nominal surprise baseline
+        #
+        # The baseline is regime-local:
+        #   1. After startup / a detected change, collect several
+        #      trustworthy blocks before initializing it.
+        #   2. Slowly update it while change evidence is small.
+        #   3. Freeze it once W becomes sufficiently suspicious.
+        # -------------------------------------------------
+        self.baseline_alpha = cfg.baseline_alpha
+        self.baseline_margin = cfg.baseline_margin
+        self.baseline_min_weight = cfg.baseline_min_weight
+        self.baseline_init_blocks = cfg.baseline_init_blocks
+        self.baseline_freeze_score = cfg.baseline_freeze_score
+
+        self.surprise_baseline = None
+
+        # Used only while constructing a new regime-local baseline.
+        self.baseline_init_sum = 0.0
+        self.baseline_init_count = 0
+
+        self.surprise_cap = cfg.surprise_cap
+        self.familiarity_gamma = cfg.familiarity_gamma
+        self.block_size = cfg.block_size
 
         self.initial_detector_warmup = cfg.initial_detector_warmup
         self.post_change_warmup = cfg.post_change_warmup
-
         self.detector_log_interval = cfg.detector_log_interval
 
-        # W_t in the paper.
         self.change_score = 0.0
-
-        # Longer calibration period only at the start of training.
         self.warmup_remaining = self.initial_detector_warmup
+
+        # Block statistics
+        self.block_evidence_sum = 0.0       # sum w_t * s_t
+        self.block_weight_sum = 0.0         # sum w_t
+        self.block_familiarity_sum = 0.0
+        self.block_surprise_sum = 0.0
+        self.block_count = 0
+        self.block_index = 0
+
+        self.state_action_familiarity = StateActionFamiliarityTracker(
+            dim=cfg.obs_dim + cfg.action_dim,
+            seed=cfg.seed + 7919,
+            norm_warmup_steps=cfg.familiarity_norm_warmup,
+            num_tables=cfg.familiarity_num_tables,
+            projections_per_table=(
+                cfg.familiarity_projections_per_table
+            ),
+            num_buckets=cfg.familiarity_num_buckets,
+            hash_width=cfg.familiarity_hash_width,
+            count_scale=cfg.familiarity_count_scale,
+            input_clip=cfg.familiarity_input_clip,
+        )
 
         # -------------------------------------------------
         # Actor / critic optimizers
@@ -579,12 +864,9 @@ class AVG:
                 dim=0,
             )
 
-            # Ensemble mean:
-            # mu_* = 1/N sum_n mu_n
+            # Moment-matched ensemble predictive distribution.
             mu_star = means.mean(dim=0)
 
-            # Total ensemble covariance diagonal:
-            # E[var_n + mu_n^2] - E[mu_n]^2
             var_star = (
                 (
                     variances
@@ -598,7 +880,6 @@ class AVG:
                 min=1e-8,
             )
 
-            # Pure between-model disagreement, useful for debugging.
             epistemic_var = (
                 (
                     means
@@ -606,175 +887,339 @@ class AVG:
                 ).pow(2)
             ).mean(dim=0)
 
-            log_p_hat = diagonal_gaussian_log_prob(
-                detector_target,
-                mu_star,
-                var_star,
+            # Dimension-normalized Gaussian innovation surprise:
+            #   s_t = mean_j (y_j - mu_j)^2 / var_j
+            surprise_raw = (
+                (
+                    detector_target
+                    - mu_star
+                ).pow(2)
+                / var_star
+            ).mean().item()
+
+            surprise_clipped = float(
+                np.clip(
+                    surprise_raw,
+                    0.0,
+                    self.surprise_cap,
+                )
             )
-
-            # -------------------------------------------------
-            # Alternative distribution p_new
-            #
-            # This matches the CURRENT DRAFT literally:
-            #
-            # mu_new =
-            #   [S_{t+1}, R_{t+1}]
-            #   + delta * diag(Sigma_*)
-            #
-            # Since var_star stores diag(Sigma_*), use var_star.
-            # If we later decide delta is explicitly measured in
-            # standard deviations, change this ONE line to:
-            #
-            # mu_new = detector_target + delta * sqrt(var_star)
-            # -------------------------------------------------
-
-            mu_new = (
-                detector_target
-                + self.detector_delta
-                * var_star
-            )
-
-            log_p_new = diagonal_gaussian_log_prob(
-                detector_target,
-                mu_new,
-                var_star,
-            )
-
-            L_t_raw = (
-                log_p_new
-                - log_p_hat
-            ).item()
-
-            L_t = np.clip(
-                L_t_raw,
-                -5.0,
-                5.0,
-            )
-
-            log_p_hat_value = log_p_hat.item()
-            log_p_new_value = log_p_new.item()
 
             mean_total_var = var_star.mean().item()
             mean_epistemic_var = epistemic_var.mean().item()
 
         # =================================================
-        # 2. Likelihood-ratio CUSUM
+        # 2. State-action familiarity
+        # =================================================
+
+        state_action_np = np.concatenate(
+            (
+                raw_obs.detach().cpu().numpy().reshape(-1),
+                detector_action.detach().cpu().numpy().reshape(-1),
+            )
+        ).astype(np.float64)
+
+        (
+            state_action_pseudo_count,
+            familiarity,
+            familiarity_ready,
+        ) = self.state_action_familiarity.observe(
+            state_action_np
+        )
+
+        # Less-familiar inputs are strongly suppressed rather than
+        # creating change evidence. With gamma=4, for example,
+        # F=0.3 contributes only 0.3^4 = 0.0081 of its raw surprise.
+        if familiarity_ready:
+            familiarity_weight = (
+                familiarity ** self.familiarity_gamma
+            )
+
+            # Keep this for diagnostics:
+            # e_t = w_t * s_t
+            e_t = (
+                familiarity_weight
+                * surprise_clipped
+            )
+        else:
+            familiarity_weight = 0.0
+            e_t = 0.0
+
+        # =================================================
+        # 3. Block evidence and CUSUM
         # =================================================
 
         regime_change = False
-        warning = False
-        freeze_predictors = False
-
-        # Keep this for logging if W is reset on detection.
+        block_completed = False
+        block_E_k = float("nan")
         W_for_log = self.change_score
 
         if self.warmup_remaining > 0:
-
-            # Calibration/adaptation period. We deliberately do
-            # not accumulate change evidence here.
+            # Predictor and familiarity keep learning during warmup;
+            # only detector accumulation is disabled.
             self.warmup_remaining -= 1
 
-            predictor_update = True
+            self.block_evidence_sum = 0.0
+            self.block_weight_sum = 0.0
+            self.block_familiarity_sum = 0.0
+            self.block_surprise_sum = 0.0
+            self.block_count = 0
 
-            W_for_log = self.change_score
+        elif familiarity_ready:
+            self.block_evidence_sum += e_t
+            self.block_weight_sum += familiarity_weight
+            self.block_familiarity_sum += familiarity
+            self.block_surprise_sum += surprise_clipped
+            self.block_count += 1
 
-        else:
+            if self.block_count >= self.block_size:
+                block_completed = True
 
-            self.change_score = max(
-                0.0,
-                self.change_score + L_t,
-            )
+                block_E_k = (
+                    self.block_evidence_sum
+                    / float(self.block_count)
+                )
 
-            W_for_log = self.change_score
+                mean_block_familiarity = (
+                    self.block_familiarity_sum
+                    / float(self.block_count)
+                )
 
-            if self.change_score > self.detector_h:
+                mean_block_surprise = (
+                    self.block_surprise_sum
+                    / float(self.block_count)
+                )
 
-                regime_change = True
+                # Average gated evidence, kept mainly for logging:
+                # E_k = (1/B) sum_t w_t s_t
+                block_E_k = (
+                    self.block_evidence_sum
+                    / float(self.block_count)
+                )
 
-                with open(
-                    self.regime_log_path,
-                    "a",
-                ) as f:
+                # Average familiarity weight:
+                # w_bar = (1/B) sum_t w_t
+                mean_block_weight = (
+                    self.block_weight_sum
+                    / float(self.block_count)
+                )
 
-                    f.write(
-                        f"step={self.steps}, "
-                        f"L_t={L_t:.6f}, "
-                        f"W_t={self.change_score:.6f}, "
-                        f"log_p_hat={log_p_hat_value:.6f}, "
-                        f"log_p_new={log_p_new_value:.6f}, "
-                        f"mean_total_var={mean_total_var:.6f}, "
-                        f"mean_epistemic_var="
-                        f"{mean_epistemic_var:.6f}\n"
+                # Familiarity-weighted estimate of raw surprise:
+                #
+                #   s_hat_k = sum w_t s_t / sum w_t
+                #
+                if self.block_weight_sum > 1e-8:
+                    weighted_surprise_mean = (
+                        self.block_evidence_sum
+                        / self.block_weight_sum
+                    )
+                else:
+                    weighted_surprise_mean = float("nan")
+
+
+                # -------------------------------------------------
+                # Surprise baseline + familiarity-gated CUSUM
+                # -------------------------------------------------
+
+                block_change_evidence = 0.0
+
+                # =================================================
+                # A. No baseline yet:
+                #    collect several trustworthy blocks first.
+                # =================================================
+                if self.surprise_baseline is None:
+
+                    if (
+                        mean_block_weight
+                        >= self.baseline_min_weight
+                        and np.isfinite(weighted_surprise_mean)
+                    ):
+                        self.baseline_init_sum += weighted_surprise_mean
+                        self.baseline_init_count += 1
+
+                        # Initialize the regime-local nominal surprise
+                        # only after enough eligible blocks have been seen.
+                        if (
+                            self.baseline_init_count
+                            >= self.baseline_init_blocks
+                        ):
+                            self.surprise_baseline = (
+                                self.baseline_init_sum
+                                / float(self.baseline_init_count)
+                            )
+
+                    # Do not accumulate change evidence until
+                    # a reliable baseline has been initialized.
+                    self.change_score = 0.0
+
+                # =================================================
+                # B. Baseline exists:
+                #    compute familiarity-gated excess surprise.
+                # =================================================
+                else:
+
+                    # G_k =
+                    #   (1/B) sum_t w_t [s_t - mu_s - delta]
+                    #
+                    # equivalently:
+                    #   E_k - (mu_s + delta) * mean(w_t)
+                    block_change_evidence = (
+                        block_E_k
+                        - (
+                            self.surprise_baseline
+                            + self.baseline_margin
+                        )
+                        * mean_block_weight
                     )
 
-                # Reset detector state, NOT predictor weights.
-                self.change_score = 0.0
+                    # Standard one-sided CUSUM.
+                    self.change_score = max(
+                        0.0,
+                        self.change_score
+                        + block_change_evidence,
+                    )
 
-                # The same ensemble now adapts to the new regime.
-                self.warmup_remaining = self.post_change_warmup
+                    # Slowly track ordinary within-regime changes in
+                    # predictive difficulty while W is still small.
+                    # Once W becomes meaningfully positive, freeze the
+                    # baseline so it cannot learn away a true regime change.
+                    if (
+                        self.change_score
+                        < self.baseline_freeze_score
+                        and mean_block_weight
+                        >= self.baseline_min_weight
+                        and np.isfinite(weighted_surprise_mean)
+                    ):
+                        self.surprise_baseline = (
+                            (1.0 - self.baseline_alpha)
+                            * self.surprise_baseline
+                            + self.baseline_alpha
+                            * weighted_surprise_mean
+                        )
 
-                predictor_update = True
+                W_for_log = self.change_score
 
-            elif (
-                self.change_score
-                >= self.detector_h_warn
-            ):
+                if self.change_score > self.detector_h:
+                    regime_change = True
 
-                # Suspicious region: freeze ALL predictor weights
-                # so the reference model cannot learn away the
-                # evidence before W crosses h.
-                warning = True
-                freeze_predictors = True
-                predictor_update = False
+                with open(
+                    self.detector_block_path,
+                    "a",
+                ) as f:
+                    f.write(
+                        f"{self.block_index},"
+                        f"{self.steps},"
+                        f"{block_E_k:.8f},"
+                        f"{self.change_score:.8f},"
+                        f"{mean_block_familiarity:.8f},"
+                        f"{mean_block_surprise:.8f},"
+                        f"{int(regime_change)}\n"
+                    )
 
-            else:
+                self.block_index += 1
+                self.block_evidence_sum = 0.0
+                self.block_weight_sum = 0.0
+                self.block_familiarity_sum = 0.0
+                self.block_surprise_sum = 0.0
+                self.block_count = 0
 
-                predictor_update = True
+                if regime_change:
+                    with open(
+                        self.regime_log_path,
+                        "a",
+                    ) as f:
+                        f.write(
+                            f"step={self.steps}, "
+                            f"E_k={block_E_k:.8f}, "
+                            f"W_k={self.change_score:.8f}, "
+                            f"mean_familiarity="
+                            f"{mean_block_familiarity:.8f}, "
+                            f"mean_surprise="
+                            f"{mean_block_surprise:.8f}\n"
+                        )
+                    # New regime: forget old-regime state-action familiarity.
+                    self.state_action_familiarity.reset_counts()
 
+                    # Reset sequential detector state.
+                    self.change_score = 0.0
+
+                    # The old regime's nominal surprise level is no longer
+                    # the appropriate reference.
+                    self.surprise_baseline = None
+
+                    # Restart multi-block baseline initialization.
+                    self.baseline_init_sum = 0.0
+                    self.baseline_init_count = 0
+
+                    # Predictor continues learning normally, but detector
+                    # accumulation is disabled during the short warmup.
+                    self.warmup_remaining = self.post_change_warmup
         # =================================================
-        # 3. Online Poisson bootstrap predictor update
+        # 4. Online Poisson bootstrap predictor update
+        #
+        # Always learn after scoring the current transition. There is no
+        # warning-stage freeze in this simple detector.
         # =================================================
+
+        # Temporary post-change predictor plasticity.
+        # if self.predictor_adapt_remaining > 0:
+        #     progress = (
+        #         self.predictor_adapt_remaining
+        #         / float(self.cfg.predictor_adapt_steps)
+        #     )
+
+        #     predictor_lr = (
+        #         self.cfg.predictor_lr
+        #         + (
+        #             self.cfg.predictor_fast_lr
+        #             - self.cfg.predictor_lr
+        #         )
+        #         * progress
+        #     )
+
+        #     self.predictor_adapt_remaining -= 1
+
+        # else:
+        #     predictor_lr = self.cfg.predictor_lr
+
+        # for opt in self.pred_opts:
+        #     for group in opt.param_groups:
+        #         group["lr"] = predictor_lr
+
 
         predictor_nll_values = []
 
-        if predictor_update:
+        for n, (
+            mean_n,
+            logvar_n,
+            var_n,
+        ) in enumerate(predictor_outputs):
 
-            for n, (
+            k_n_t = np.random.poisson(1.0)
+
+            if k_n_t == 0:
+                continue
+
+            log_prob_n = diagonal_gaussian_log_prob(
+                detector_target,
                 mean_n,
-                logvar_n,
                 var_n,
-            ) in enumerate(predictor_outputs):
+            )
 
-                # One streaming transition, one possible optimizer
-                # update for this predictor. k=0 means this bootstrap
-                # member skips the sample. k>0 weights the NLL.
-                k_n_t = np.random.poisson(1.0)
+            nll_n = -log_prob_n.mean()
 
-                if k_n_t == 0:
-                    continue
+            loss_n = (
+                float(k_n_t)
+                * nll_n
+            )
 
-                log_prob_n = diagonal_gaussian_log_prob(
-                    detector_target,
-                    mean_n,
-                    var_n,
-                )
+            self.pred_opts[n].zero_grad()
+            loss_n.backward()
+            self.pred_opts[n].step()
 
-                nll_n = -log_prob_n.mean()
-
-                loss_n = (
-                    float(k_n_t)
-                    * nll_n
-                )
-
-                self.pred_opts[n].zero_grad()
-
-                loss_n.backward()
-
-                self.pred_opts[n].step()
-
-                predictor_nll_values.append(
-                    nll_n.detach().item()
-                )
+            predictor_nll_values.append(
+                nll_n.detach().item()
+            )
 
         if predictor_nll_values:
             predictor_nll = float(
@@ -784,7 +1229,7 @@ class AVG:
             predictor_nll = float("nan")
 
         # =================================================
-        # 4. Detector logging
+        # 5. Detector logging
         # =================================================
 
         if self.steps % self.detector_log_interval == 0:
@@ -796,21 +1241,23 @@ class AVG:
 
                 f.write(
                     f"{self.steps},"
-                    f"{L_t:.8f},"
+                    f"{surprise_raw:.8f},"
+                    f"{surprise_clipped:.8f},"
+                    f"{state_action_pseudo_count},"
+                    f"{familiarity:.8f},"
+                    f"{e_t:.8f},"
+                    f"{block_E_k:.8f},"
                     f"{W_for_log:.8f},"
-                    f"{log_p_hat_value:.8f},"
-                    f"{log_p_new_value:.8f},"
-                    f"{mean_total_var:.8f},"
-                    f"{mean_epistemic_var:.8f},"
-                    f"{int(warning)},"
-                    f"{int(freeze_predictors)},"
+                    f"{int(block_completed)},"
                     f"{self.warmup_remaining},"
                     f"{int(regime_change)},"
+                    f"{mean_total_var:.8f},"
+                    f"{mean_epistemic_var:.8f},"
                     f"{predictor_nll:.8f}\n"
                 )
 
         # =================================================
-        # 5. Original AVG update
+        # 6. Original AVG update
         # =================================================
 
         # -------------------------------------------------
@@ -907,16 +1354,18 @@ class AVG:
         self.steps += 1
 
         return {
-            "L_t": L_t,
-            "W_t": W_for_log,
-            "log_p_hat": log_p_hat_value,
-            "log_p_new": log_p_new_value,
-            "mean_total_var": mean_total_var,
-            "mean_epistemic_var": mean_epistemic_var,
-            "warning": warning,
-            "predictors_frozen": freeze_predictors,
+            "surprise_raw": surprise_raw,
+            "surprise_clipped": surprise_clipped,
+            "state_action_pseudo_count": state_action_pseudo_count,
+            "familiarity": familiarity,
+            "e_t": e_t,
+            "E_k": block_E_k,
+            "W_k": W_for_log,
+            "block_completed": block_completed,
             "warmup_remaining": self.warmup_remaining,
             "regime_change": regime_change,
+            "mean_total_var": mean_total_var,
+            "mean_epistemic_var": mean_epistemic_var,
             "predictor_nll": predictor_nll,
         }
 
@@ -943,6 +1392,23 @@ class AVG:
                 opt.state_dict()
                 for opt in self.pred_opts
             ],
+
+            "detector": {
+                "change_score": self.change_score,
+                "warmup_remaining": self.warmup_remaining,
+                "surprise_baseline": self.surprise_baseline,
+                "baseline_init_sum": self.baseline_init_sum,
+                "baseline_init_count": self.baseline_init_count,
+                "block_evidence_sum": self.block_evidence_sum,
+                "block_weight_sum": self.block_weight_sum,
+                "block_familiarity_sum": self.block_familiarity_sum,
+                "block_surprise_sum": self.block_surprise_sum,
+                "block_count": self.block_count,
+                "block_index": self.block_index,
+                "state_action_familiarity": (
+                    self.state_action_familiarity.state_dict()
+                ),
+            },
         }
 
         torch.save(
@@ -1354,6 +1820,20 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
+        "--predictor_fast_lr",
+        default=3e-4,
+        type=float,
+        help="Temporary predictor LR immediately after detected regime change",
+    )
+
+    parser.add_argument(
+        "--predictor_adapt_steps",
+        default=5_000,
+        type=int,
+        help="Steps over which predictor LR decays back to predictor_lr",
+    )
+
+    parser.add_argument(
         "--num_predictors",
         default=5,
         type=int,
@@ -1371,43 +1851,141 @@ if __name__ == "__main__":
         type=float,
     )
 
-    parser.add_argument(
-        "--detector_delta",
-        default=2.0,
-        type=float,
-    )
+    # =====================================================
+    # Surprise / familiarity detector parameters
+    # =====================================================
 
     parser.add_argument(
         "--detector_h",
-        default=100.0,
+        default=2.5,
         type=float,
+        help="CUSUM alarm threshold applied to block-level W_k",
     )
 
     parser.add_argument(
-        "--detector_h_warn",
-        default=50.0,
+        "--baseline_alpha",
+        default=0.01,
         type=float,
+        help="EMA rate for the stable-regime block evidence baseline",
+    )
+
+    parser.add_argument(
+        "--baseline_margin",
+        default=0.10,
+        type=float,
+        help="Required excess above nominal block evidence before CUSUM grows",
+    )
+
+    parser.add_argument(
+        "--baseline_min_weight",
+        default=0.5,
+        type=float,
+        help="Minimum mean F^gamma required to initialize/update surprise baseline",
+    )
+
+    parser.add_argument(
+        "--baseline_init_blocks",
+        default=20,
+        type=int,
+        help=(
+            "Number of eligible blocks used to initialize "
+            "the regime-local surprise baseline"
+        ),
+    )
+
+    parser.add_argument(
+        "--baseline_freeze_score",
+        default=0.5,
+        type=float,
+        help=(
+            "Freeze surprise-baseline adaptation once "
+            "CUSUM W_k reaches this level"
+        ),
+    )
+
+    parser.add_argument(
+        "--surprise_cap",
+        default=20.0,
+        type=float,
+        help="Clip transition surprise before familiarity weighting",
+    )
+
+    parser.add_argument(
+        "--familiarity_gamma",
+        default=4.0,
+        type=float,
+        help="Exponent in e_t = surprise * familiarity^gamma",
+    )
+
+    parser.add_argument(
+        "--block_size",
+        default=100,
+        type=int,
+        help="Transitions per block E_k",
     )
 
     parser.add_argument(
         "--initial_detector_warmup",
         default=10_000,
         type=int,
-        help="Initial predictor calibration period before CUSUM is enabled",
+        help="Initial steps with predictor learning but no CUSUM accumulation",
     )
 
     parser.add_argument(
         "--post_change_warmup",
         default=1_000,
         type=int,
-        help="Predictor adaptation period after a detected regime change",
+        help="Steps after an alarm with learning but no CUSUM accumulation",
     )
 
     parser.add_argument(
         "--detector_log_interval",
         default=100,
         type=int,
-        help="Write detector trace every N environment steps",
+        help="Write transition-level detector trace every N environment steps",
+    )
+
+    parser.add_argument(
+        "--familiarity_norm_warmup",
+        default=10_000,
+        type=int,
+        help="Samples used to estimate/freeze state-action hash normalization",
+    )
+
+    parser.add_argument(
+        "--familiarity_num_tables",
+        default=4,
+        type=int,
+    )
+
+    parser.add_argument(
+        "--familiarity_projections_per_table",
+        default=4,
+        type=int,
+    )
+
+    parser.add_argument(
+        "--familiarity_num_buckets",
+        default=65536,
+        type=int,
+    )
+
+    parser.add_argument(
+        "--familiarity_hash_width",
+        default=1.0,
+        type=float,
+    )
+
+    parser.add_argument(
+        "--familiarity_count_scale",
+        default=10.0,
+        type=float,
+    )
+
+    parser.add_argument(
+        "--familiarity_input_clip",
+        default=5.0,
+        type=float,
     )
 
     # =====================================================
@@ -1491,7 +2069,7 @@ if __name__ == "__main__":
         args.results_dir,
         (
             f"{args.env}"
-            f"_aba_joint_detector_short"
+            f"_aba_joint_surprise_familiarity_cusum"
             f"_seed-{args.seed}.pkl"
         ),
     )
