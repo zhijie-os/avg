@@ -251,11 +251,25 @@ class StateActionFamiliarityTracker:
 
     The first norm_warmup_steps inputs are used only to estimate a frozen
     mean/std. Thereafter, familiarity is queried BEFORE incrementing the
-    current buckets:
+    current buckets.
 
-        F_t = 1 - exp(-c_t / count_scale),
+    Let c_t be the median pseudo-count across independent tables and let u_t
+    be the running mean of previous regime-local pseudo-counts. Define
 
-    where c_t is the median pseudo-count across independent tables.
+        r_t = c_t / (u_t + eps).
+
+    Relative familiarity is
+
+        F_t = 0,                                      r_t <= 1
+        F_t = 1 - exp(-((r_t - 1) / lambda)^p),       r_t > 1
+
+    so merely being above the regime-average count is not enough to be
+    considered familiar. Only state-action regions with counts substantially
+    larger than the current regime-local mean approach F_t = 1.
+
+    The running count mean is updated only AFTER F_t is computed, preserving
+    score-before-update ordering. It is reset after each trusted alarm along
+    with the LSH counts.
     """
 
     def __init__(
@@ -267,7 +281,8 @@ class StateActionFamiliarityTracker:
         projections_per_table=4,
         num_buckets=4096,
         hash_width=1.0,
-        count_scale=10.0,
+        relative_scale=2.0,
+        relative_power=2.0,
         input_clip=5.0,
     ):
         self.dim = int(dim)
@@ -276,7 +291,8 @@ class StateActionFamiliarityTracker:
         self.projections_per_table = int(projections_per_table)
         self.num_buckets = int(num_buckets)
         self.hash_width = float(hash_width)
-        self.count_scale = float(count_scale)
+        self.relative_scale = float(relative_scale)
+        self.relative_power = float(relative_power)
         self.input_clip = float(input_clip)
 
         if self.dim <= 0:
@@ -289,8 +305,10 @@ class StateActionFamiliarityTracker:
             raise ValueError("Require familiarity_num_buckets >= 2")
         if self.hash_width <= 0.0:
             raise ValueError("Require familiarity_hash_width > 0")
-        if self.count_scale <= 0.0:
-            raise ValueError("Require familiarity_count_scale > 0")
+        if self.relative_scale <= 0.0:
+            raise ValueError("Require familiarity_relative_scale > 0")
+        if self.relative_power <= 0.0:
+            raise ValueError("Require familiarity_relative_power > 0")
         if self.input_clip <= 0.0:
             raise ValueError("Require familiarity_input_clip > 0")
 
@@ -335,6 +353,12 @@ class StateActionFamiliarityTracker:
         self.norm_M2 = np.zeros(self.dim, dtype=np.float64)
         self.frozen_mean = None
         self.frozen_std = None
+
+        # Regime-local running mean of queried pseudo-counts. This is used as
+        # the reference support level u_t for relative familiarity.
+        self.regime_count_n = 0
+        self.regime_count_mean = 0.0
+        self.relative_eps = 1e-8
 
     @property
     def ready(self):
@@ -409,7 +433,7 @@ class StateActionFamiliarityTracker:
 
         if not self.ready:
             self._update_normalizer(x)
-            return 0, 0.0, self.ready
+            return 0, 0.0, self.ready, 0.0, 0.0
 
         z = self._standardize(x)
         buckets = self._bucket_indices(z)
@@ -421,20 +445,51 @@ class StateActionFamiliarityTracker:
 
         pseudo_count = int(np.median(table_counts))
 
-        familiarity = float(
-            1.0
-            - np.exp(
-                -float(pseudo_count)
-                / self.count_scale
+        # Compare current support against the regime-local mean support from
+        # previous transitions. The current count must not influence its own
+        # familiarity score.
+        count_mean_before = float(self.regime_count_mean)
+
+        if self.regime_count_n == 0 or count_mean_before <= self.relative_eps:
+            count_ratio = 0.0
+            familiarity = 0.0
+        else:
+            count_ratio = (
+                float(pseudo_count)
+                / (count_mean_before + self.relative_eps)
             )
-        )
+
+            if count_ratio <= 1.0:
+                familiarity = 0.0
+            else:
+                scaled_excess = (
+                    (count_ratio - 1.0)
+                    / self.relative_scale
+                )
+                familiarity = float(
+                    1.0
+                    - np.exp(
+                        -(scaled_excess ** self.relative_power)
+                    )
+                )
+
+        # Update u_t only after scoring this transition.
+        self.regime_count_n += 1
+        count_delta = float(pseudo_count) - self.regime_count_mean
+        self.regime_count_mean += count_delta / float(self.regime_count_n)
 
         max_uint32 = np.iinfo(np.uint32).max
         for table_idx, bucket in enumerate(buckets):
             if self.counts[table_idx, bucket] < max_uint32:
                 self.counts[table_idx, bucket] += 1
 
-        return pseudo_count, familiarity, True
+        return (
+            pseudo_count,
+            familiarity,
+            True,
+            count_mean_before,
+            count_ratio,
+        )
 
     def reset_counts(self):
         """
@@ -442,6 +497,8 @@ class StateActionFamiliarityTracker:
         preserving the fixed LSH projections and frozen normalization.
         """
         self.counts.fill(0)
+        self.regime_count_n = 0
+        self.regime_count_mean = 0.0
 
     def state_dict(self):
         return {
@@ -451,6 +508,528 @@ class StateActionFamiliarityTracker:
             "frozen_mean": self.frozen_mean,
             "frozen_std": self.frozen_std,
             "counts": self.counts,
+            "regime_count_n": self.regime_count_n,
+            "regime_count_mean": self.regime_count_mean,
+            "relative_scale": self.relative_scale,
+            "relative_power": self.relative_power,
+        }
+
+
+# =========================================================
+# Fixed-memory local conditional outcome models
+# =========================================================
+
+class StateActionConditionalOutcomeTracker:
+    """
+    Fixed-memory local conditional models for
+
+        x_t = [S_t, A_t]
+        y_t = [Delta S_t, R_{t+1}].
+
+    The existing StateActionFamiliarityTracker selects one LSH bucket per
+    table.  Instead of treating every x in a bucket as having the same
+    outcome mean, each selected bucket owns an independent affine model
+
+        y_hat = phi(x)^T W_b,
+        phi(x) = [z(x), 1],
+
+    where z(x) is the same frozen standardized/clipped state-action vector
+    used by the familiarity tracker.
+
+    W_b is learned online with ridge-initialized recursive least squares
+    (RLS).  Buckets share no learned parameters, so training in one region
+    cannot overwrite predictions in another region.
+
+    After an initial model warmup, every bucket also keeps Welford statistics
+    of its own PRE-UPDATE prediction residuals.  A transition is scored by
+
+        q_t^(l) =
+            mean_j
+            (e_{t,j} - mean_e[b,j])^2
+            / (var_e[b,j] + floor),
+
+        e_t = y_t - y_hat_t,
+
+    using only historical residual statistics.  The final diagnostic is the
+    median q_t^(l) across sufficiently supported LSH tables.
+
+    Ordering is strictly:
+
+        predict -> score -> update residual statistics -> update local model.
+
+    No transitions are retained.  Memory is fixed by the number of tables,
+    buckets, input dimensions, and output dimensions.
+    """
+
+    def __init__(
+        self,
+        familiarity_tracker,
+        target_dim,
+        min_bucket_count=20,
+        min_tables=2,
+        variance_floor=1e-3,
+        surprise_cap=20.0,
+        ridge=1.0,
+    ):
+        self.familiarity_tracker = familiarity_tracker
+        self.target_dim = int(target_dim)
+        self.min_bucket_count = int(min_bucket_count)
+        self.min_tables = int(min_tables)
+        self.variance_floor = float(variance_floor)
+        self.surprise_cap = float(surprise_cap)
+        self.ridge = float(ridge)
+
+        if self.target_dim <= 0:
+            raise ValueError("Require conditional target_dim > 0")
+        if self.min_bucket_count < 2:
+            raise ValueError("Require conditional_min_bucket_count >= 2")
+        if (
+            self.min_tables < 1
+            or self.min_tables > self.familiarity_tracker.num_tables
+        ):
+            raise ValueError(
+                "Require 1 <= conditional_min_tables <= familiarity_num_tables"
+            )
+        if self.variance_floor <= 0.0:
+            raise ValueError("Require conditional_variance_floor > 0")
+        if self.surprise_cap <= 0.0:
+            raise ValueError("Require conditional_surprise_cap > 0")
+        if self.ridge <= 0.0:
+            raise ValueError("Require conditional_ridge > 0")
+
+        self.input_dim = int(self.familiarity_tracker.dim)
+        self.feature_dim = self.input_dim + 1  # affine bias
+
+        shape = (
+            self.familiarity_tracker.num_tables,
+            self.familiarity_tracker.num_buckets,
+        )
+
+        # Number of observations used to train each local model.
+        self.counts = np.zeros(
+            shape,
+            dtype=np.uint32,
+        )
+
+        # Local affine coefficient matrix W_b:
+        #     [feature_dim, target_dim]
+        self.weights = np.zeros(
+            shape + (self.feature_dim, self.target_dim),
+            dtype=np.float32,
+        )
+
+        # RLS inverse regularized design matrix:
+        #     P_b = (ridge I + sum phi phi^T)^(-1)
+        #
+        # Initial P = I / ridge.
+        self.P = np.zeros(
+            shape + (self.feature_dim, self.feature_dim),
+            dtype=np.float32,
+        )
+
+        diag = np.arange(self.feature_dim)
+        self.P[..., diag, diag] = np.float32(1.0 / self.ridge)
+
+        # Historical PRE-UPDATE local-model residual statistics.
+        #
+        # We intentionally begin collecting these only after the local model
+        # has seen min_bucket_count samples.  This prevents the very early
+        # zero/undertrained model residuals from defining the nominal scale.
+        self.residual_counts = np.zeros(
+            shape,
+            dtype=np.uint32,
+        )
+        self.residual_mean = np.zeros(
+            shape + (self.target_dim,),
+            dtype=np.float32,
+        )
+        self.residual_M2 = np.zeros(
+            shape + (self.target_dim,),
+            dtype=np.float32,
+        )
+
+    def _feature_vector(self, x):
+        """
+        Return the exact standardized state-action vector plus affine bias.
+
+        This is deliberately richer than the old constant bucket model:
+        two points that hash to the same bucket may still receive different
+        predictions because their full standardized x vectors differ.
+        """
+        z = self.familiarity_tracker._standardize(x)
+
+        phi = np.empty(
+            self.feature_dim,
+            dtype=np.float64,
+        )
+        phi[:-1] = z
+        phi[-1] = 1.0
+
+        return z, phi
+
+    def observe(self, x, y):
+        """
+        Return:
+            conditional_surprise_raw,
+            conditional_surprise_clipped,
+            median_historical_count,
+            tables_used
+
+        The same current transition is scored independently by the local model
+        in each LSH table.  Only tables with both:
+          1. a sufficiently trained local model, and
+          2. enough historical local-model residuals
+        may contribute to the score.
+
+        The current transition NEVER influences its own prediction, residual
+        baseline, or surprise score.
+        """
+        if not self.familiarity_tracker.ready:
+            return float("nan"), float("nan"), 0.0, 0
+
+        x = np.asarray(
+            x,
+            dtype=np.float64,
+        ).reshape(-1)
+
+        y = np.asarray(
+            y,
+            dtype=np.float64,
+        ).reshape(-1)
+
+        if x.shape[0] != self.input_dim:
+            raise ValueError(
+                f"Expected conditional x dimension "
+                f"{self.input_dim}, got {x.shape[0]}"
+            )
+
+        if y.shape[0] != self.target_dim:
+            raise ValueError(
+                f"Expected conditional y dimension "
+                f"{self.target_dim}, got {y.shape[0]}"
+            )
+
+        z, phi = self._feature_vector(x)
+        buckets = self.familiarity_tracker._bucket_indices(z)
+
+        table_scores = []
+        table_counts = []
+
+        # Cache each table's pre-update residual because the exact same
+        # residual is used below for historical residual statistics and RLS.
+        preupdate_residuals = []
+
+        # -------------------------------------------------
+        # 1. Predict and score BEFORE any update.
+        # -------------------------------------------------
+        for table_idx, bucket in enumerate(buckets):
+            n = int(
+                self.counts[
+                    table_idx,
+                    bucket,
+                ]
+            )
+
+            residual_n = int(
+                self.residual_counts[
+                    table_idx,
+                    bucket,
+                ]
+            )
+
+            table_counts.append(n)
+
+            W = self.weights[
+                table_idx,
+                bucket,
+            ].astype(
+                np.float64,
+                copy=False,
+            )
+
+            prediction = phi @ W
+            residual = y - prediction
+            preupdate_residuals.append(residual)
+
+            # Two-stage support requirement:
+            #
+            #   first min_bucket_count observations -> train local model
+            #   next  min_bucket_count residuals    -> estimate nominal
+            #                                          local residual scale
+            #
+            # Only after both exist do we emit q_t for this table.
+            if (
+                n < self.min_bucket_count
+                or residual_n < self.min_bucket_count
+            ):
+                continue
+
+            residual_mean = self.residual_mean[
+                table_idx,
+                bucket,
+            ].astype(
+                np.float64,
+                copy=False,
+            )
+
+            residual_M2 = self.residual_M2[
+                table_idx,
+                bucket,
+            ].astype(
+                np.float64,
+                copy=False,
+            )
+
+            residual_var = (
+                residual_M2
+                / float(max(residual_n - 1, 1))
+            )
+
+            residual_var = np.maximum(
+                residual_var,
+                self.variance_floor,
+            )
+
+            centered_residual = (
+                residual - residual_mean
+            )
+
+            score = float(
+                np.mean(
+                    centered_residual ** 2
+                    / residual_var
+                )
+            )
+
+            if np.isfinite(score):
+                table_scores.append(score)
+
+        median_historical_count = (
+            float(np.median(table_counts))
+            if table_counts
+            else 0.0
+        )
+
+        if len(table_scores) >= self.min_tables:
+            conditional_surprise_raw = float(
+                np.median(table_scores)
+            )
+
+            conditional_surprise_clipped = float(
+                np.clip(
+                    conditional_surprise_raw,
+                    0.0,
+                    self.surprise_cap,
+                )
+            )
+        else:
+            conditional_surprise_raw = float("nan")
+            conditional_surprise_clipped = float("nan")
+
+        # -------------------------------------------------
+        # 2. Update historical PRE-UPDATE residual stats.
+        # -------------------------------------------------
+        max_uint32 = np.iinfo(np.uint32).max
+
+        for table_idx, bucket in enumerate(buckets):
+            n = int(
+                self.counts[
+                    table_idx,
+                    bucket,
+                ]
+            )
+
+            residual = preupdate_residuals[
+                table_idx
+            ]
+
+            # Do not let the badly undertrained initial local model define
+            # the nominal residual distribution.
+            if n >= self.min_bucket_count:
+                residual_n = int(
+                    self.residual_counts[
+                        table_idx,
+                        bucket,
+                    ]
+                )
+
+                if residual_n < max_uint32:
+                    new_residual_n = residual_n + 1
+
+                    old_mean = self.residual_mean[
+                        table_idx,
+                        bucket,
+                    ].astype(
+                        np.float64,
+                        copy=True,
+                    )
+
+                    old_M2 = self.residual_M2[
+                        table_idx,
+                        bucket,
+                    ].astype(
+                        np.float64,
+                        copy=True,
+                    )
+
+                    delta = residual - old_mean
+                    new_mean = (
+                        old_mean
+                        + delta / float(new_residual_n)
+                    )
+                    delta2 = residual - new_mean
+                    new_M2 = (
+                        old_M2
+                        + delta * delta2
+                    )
+
+                    self.residual_counts[
+                        table_idx,
+                        bucket,
+                    ] = new_residual_n
+
+                    self.residual_mean[
+                        table_idx,
+                        bucket,
+                    ] = new_mean.astype(np.float32)
+
+                    self.residual_M2[
+                        table_idx,
+                        bucket,
+                    ] = new_M2.astype(np.float32)
+
+        # -------------------------------------------------
+        # 3. RLS update of the local affine models.
+        #
+        # For one bucket:
+        #
+        #   P   <- P - P phi phi^T P / (1 + phi^T P phi)
+        #   W   <- W + K (y - phi^T W)^T
+        #   K    = P phi / (1 + phi^T P phi)
+        #
+        # The residual here is still the PRE-UPDATE residual.
+        # -------------------------------------------------
+        for table_idx, bucket in enumerate(buckets):
+            n = int(
+                self.counts[
+                    table_idx,
+                    bucket,
+                ]
+            )
+
+            if n >= max_uint32:
+                continue
+
+            P = self.P[
+                table_idx,
+                bucket,
+            ].astype(
+                np.float64,
+                copy=False,
+            )
+
+            W = self.weights[
+                table_idx,
+                bucket,
+            ].astype(
+                np.float64,
+                copy=False,
+            )
+
+            residual = preupdate_residuals[
+                table_idx
+            ]
+
+            P_phi = P @ phi
+
+            denominator = float(
+                1.0 + phi @ P_phi
+            )
+
+            # ridge > 0 makes this positive in exact arithmetic.
+            denominator = max(
+                denominator,
+                1e-12,
+            )
+
+            gain = (
+                P_phi / denominator
+            )
+
+            new_W = (
+                W
+                + np.outer(
+                    gain,
+                    residual,
+                )
+            )
+
+            new_P = (
+                P
+                - np.outer(
+                    gain,
+                    P_phi,
+                )
+            )
+
+            # Remove tiny numerical asymmetry from repeated float32 storage.
+            new_P = 0.5 * (
+                new_P + new_P.T
+            )
+
+            self.weights[
+                table_idx,
+                bucket,
+            ] = new_W.astype(np.float32)
+
+            self.P[
+                table_idx,
+                bucket,
+            ] = new_P.astype(np.float32)
+
+            self.counts[
+                table_idx,
+                bucket,
+            ] = n + 1
+
+        return (
+            conditional_surprise_raw,
+            conditional_surprise_clipped,
+            median_historical_count,
+            len(table_scores),
+        )
+
+    def reset(self):
+        """Forget all regime-local local-model and residual statistics."""
+        self.counts.fill(0)
+        self.weights.fill(0.0)
+
+        self.P.fill(0.0)
+        diag = np.arange(self.feature_dim)
+        self.P[..., diag, diag] = np.float32(
+            1.0 / self.ridge
+        )
+
+        self.residual_counts.fill(0)
+        self.residual_mean.fill(0.0)
+        self.residual_M2.fill(0.0)
+
+    def state_dict(self):
+        return {
+            "counts": self.counts,
+            "weights": self.weights,
+            "P": self.P,
+            "residual_counts": self.residual_counts,
+            "residual_mean": self.residual_mean,
+            "residual_M2": self.residual_M2,
+            "input_dim": self.input_dim,
+            "feature_dim": self.feature_dim,
+            "target_dim": self.target_dim,
+            "min_bucket_count": self.min_bucket_count,
+            "min_tables": self.min_tables,
+            "variance_floor": self.variance_floor,
+            "surprise_cap": self.surprise_cap,
+            "ridge": self.ridge,
         }
 
 
@@ -721,18 +1300,27 @@ class AVG:
         with open(self.detector_trace_path, "w") as f:
             f.write(
                 "step,surprise_raw,surprise_clipped,"
-                "state_action_pseudo_count,familiarity,e_t,"
+                "state_action_pseudo_count,familiarity_count_mean,"
+                "familiarity_count_ratio,familiarity,e_t,"
                 "block_E_k,W_k,block_completed,warmup_remaining,"
                 "regime_change,mean_total_var,mean_epistemic_var,"
                 "raw_residual_mse,raw_delta_state_mse,raw_reward_sq_error,"
                 "mean_total_var_raw,mean_epistemic_var_raw,"
-                "gradient_coherence,gradient_novelty,predictor_nll\n"
+                "gradient_coherence,gradient_novelty,predictor_nll,"
+                "conditional_surprise_raw,conditional_surprise_clipped,"
+                "conditional_historical_count,conditional_tables_used\n"
             )
 
         with open(self.detector_block_path, "w") as f:
             f.write(
                 "block_index,step,E_k,W_k,"
+                "mean_pseudo_count,mean_count_reference,mean_count_ratio,"
                 "mean_familiarity,mean_surprise,"
+                "mean_conditional_surprise,mean_conditional_support,"
+                "conditional_valid_fraction,"
+                "conditional_z,conditional_run_length,"
+                "conditional_baseline_n,conditional_baseline_mean,"
+                "conditional_baseline_std,"
                 "mean_gradient_coherence,mean_gradient_novelty,"
                 "regime_change\n"
             )
@@ -901,11 +1489,58 @@ class AVG:
         self.change_score = 0.0
         self.warmup_remaining = self.initial_detector_warmup
 
+        # -------------------------------------------------
+        # Local-conditional block decision rule
+        #
+        # Q_k = mean local conditional surprise in block k.
+        #
+        # A regime-local Welford baseline standardizes Q_k:
+        #
+        #     Z_k = (Q_k - mean_Q) / std_Q.
+        #
+        # The current block is ALWAYS scored against the baseline from
+        # previous blocks.  Blocks with Z_k above the one-sided threshold
+        # are NOT inserted into the baseline.  A change is declared only
+        # after a contiguous run of abnormal blocks.
+        #
+        # This is a practical streaming heuristic, not a theorem-calibrated
+        # false-alarm guarantee.  The purpose of Z_k is to make the decision
+        # rule comparable across seeds with different raw Q_k scales.
+        # -------------------------------------------------
+        self.conditional_decision_init_blocks = (
+            cfg.conditional_decision_init_blocks
+        )
+        self.conditional_decision_min_valid_fraction = (
+            cfg.conditional_decision_min_valid_fraction
+        )
+        self.conditional_decision_z_threshold = (
+            cfg.conditional_decision_z_threshold
+        )
+        self.conditional_decision_persistence = (
+            cfg.conditional_decision_persistence
+        )
+        self.conditional_decision_eps = 1e-8
+
+        self.conditional_baseline_n = 0
+        self.conditional_baseline_mean = 0.0
+        self.conditional_baseline_M2 = 0.0
+        self.conditional_exceedance_run = 0
+
         # Block statistics
         self.block_evidence_sum = 0.0       # sum w_t * s_t
         self.block_weight_sum = 0.0         # sum w_t
+        self.block_pseudo_count_sum = 0.0
+        self.block_count_reference_sum = 0.0
+        self.block_count_ratio_sum = 0.0
         self.block_familiarity_sum = 0.0
         self.block_surprise_sum = 0.0
+
+        # Historical conditional-anchor diagnostics.  Only transitions with
+        # enough pre-existing bucket support contribute.
+        self.block_conditional_surprise_sum = 0.0
+        self.block_conditional_support_sum = 0.0
+        self.block_conditional_valid_count = 0
+
         self.block_gradient_coherence_sum = 0.0
         self.block_gradient_novelty_sum = 0.0
         self.block_gradient_count = 0
@@ -922,8 +1557,22 @@ class AVG:
             ),
             num_buckets=cfg.familiarity_num_buckets,
             hash_width=cfg.familiarity_hash_width,
-            count_scale=cfg.familiarity_count_scale,
+            relative_scale=cfg.familiarity_relative_scale,
+            relative_power=cfg.familiarity_relative_power,
             input_clip=cfg.familiarity_input_clip,
+        )
+
+        # Independent local affine models for the conditional mapping
+        # (S_t, A_t) -> (Delta S_t, R_{t+1}).  Every LSH bucket gets its own
+        # fixed-memory RLS model; buckets share no learned parameters.
+        self.conditional_outcome_tracker = StateActionConditionalOutcomeTracker(
+            familiarity_tracker=self.state_action_familiarity,
+            target_dim=cfg.obs_dim + 1,
+            min_bucket_count=cfg.conditional_min_bucket_count,
+            min_tables=cfg.conditional_min_tables,
+            variance_floor=cfg.conditional_variance_floor,
+            surprise_cap=cfg.conditional_surprise_cap,
+            ridge=cfg.conditional_ridge,
         )
 
         # -------------------------------------------------
@@ -952,6 +1601,160 @@ class AVG:
         self.td_error_scaler = TDErrorScaler()
 
         self.G = 0
+
+
+    # =====================================================
+    # Local-conditional block decision
+    # =====================================================
+
+    def _conditional_baseline_std(self):
+        if self.conditional_baseline_n < 2:
+            return float("nan")
+
+        variance = (
+            self.conditional_baseline_M2
+            / float(self.conditional_baseline_n - 1)
+        )
+
+        return float(
+            np.sqrt(
+                max(
+                    variance,
+                    self.conditional_decision_eps,
+                )
+            )
+        )
+
+    def _conditional_baseline_update(self, q):
+        """Welford update using one accepted nominal block Q_k."""
+        q = float(q)
+
+        self.conditional_baseline_n += 1
+
+        delta = (
+            q - self.conditional_baseline_mean
+        )
+
+        self.conditional_baseline_mean += (
+            delta
+            / float(self.conditional_baseline_n)
+        )
+
+        delta2 = (
+            q - self.conditional_baseline_mean
+        )
+
+        self.conditional_baseline_M2 += (
+            delta * delta2
+        )
+
+    def _reset_conditional_decision_state(self):
+        """Start a fresh regime-local block baseline after an alarm."""
+        self.conditional_baseline_n = 0
+        self.conditional_baseline_mean = 0.0
+        self.conditional_baseline_M2 = 0.0
+        self.conditional_exceedance_run = 0
+
+    def _conditional_block_decision(
+        self,
+        q,
+        valid_fraction,
+    ):
+        """
+        Score one completed block and return
+
+            z,
+            run_length,
+            baseline_n,
+            baseline_mean,
+            baseline_std,
+            alarm.
+
+        Only blocks with enough valid local-model transitions participate.
+        Missing/low-support blocks break persistence because there is no
+        positive evidence that the conditional mapping changed.
+
+        Baseline construction:
+          * collect conditional_decision_init_blocks eligible blocks;
+          * after initialization, score before updating;
+          * abnormal blocks (Z > threshold) are frozen out of the baseline;
+          * ordinary blocks reset the run length and update Welford stats.
+
+        Alarm:
+          conditional_decision_persistence consecutive abnormal blocks.
+        """
+        q = float(q)
+        valid_fraction = float(valid_fraction)
+
+        baseline_std = self._conditional_baseline_std()
+
+        if (
+            not np.isfinite(q)
+            or valid_fraction
+            < self.conditional_decision_min_valid_fraction
+        ):
+            self.conditional_exceedance_run = 0
+
+            return (
+                float("nan"),
+                self.conditional_exceedance_run,
+                self.conditional_baseline_n,
+                self.conditional_baseline_mean,
+                baseline_std,
+                False,
+            )
+
+        # Build the initial per-regime baseline before making decisions.
+        if (
+            self.conditional_baseline_n
+            < self.conditional_decision_init_blocks
+        ):
+            self._conditional_baseline_update(q)
+            self.conditional_exceedance_run = 0
+
+            return (
+                float("nan"),
+                self.conditional_exceedance_run,
+                self.conditional_baseline_n,
+                self.conditional_baseline_mean,
+                self._conditional_baseline_std(),
+                False,
+            )
+
+        baseline_mean_before = float(
+            self.conditional_baseline_mean
+        )
+
+        baseline_std_before = self._conditional_baseline_std()
+
+        z = (
+            q - baseline_mean_before
+        ) / max(
+            baseline_std_before,
+            self.conditional_decision_eps,
+        )
+
+        if z > self.conditional_decision_z_threshold:
+            # Freeze the baseline during a suspicious excursion.
+            self.conditional_exceedance_run += 1
+        else:
+            # The excursion ended.  This is accepted as another nominal block.
+            self.conditional_exceedance_run = 0
+            self._conditional_baseline_update(q)
+
+        alarm = (
+            self.conditional_exceedance_run
+            >= self.conditional_decision_persistence
+        )
+
+        return (
+            float(z),
+            self.conditional_exceedance_run,
+            self.conditional_baseline_n,
+            baseline_mean_before,
+            baseline_std_before,
+            bool(alarm),
+        )
 
 
     # =====================================================
@@ -1414,13 +2217,54 @@ class AVG:
             state_action_pseudo_count,
             familiarity,
             familiarity_ready,
+            familiarity_count_mean,
+            familiarity_count_ratio,
         ) = self.state_action_familiarity.observe(
             state_action_np
         )
 
-        # Less-familiar inputs are strongly suppressed rather than
-        # creating change evidence. With gamma=4, for example,
-        # F=0.3 contributes only 0.3^4 = 0.0081 of its raw surprise.
+        # -------------------------------------------------
+        # Local conditional outcome models
+        #
+        # This score is independent of the global neural predictor parameters.
+        # Each LSH bucket predicts y_t from the exact standardized current
+        # state-action x_t using its own local affine RLS model.
+        #
+        # The target normalizer must already be frozen so historical y values
+        # live in one fixed coordinate system across the run.
+        # -------------------------------------------------
+        conditional_target_np = (
+            detector_target.detach()
+            .cpu()
+            .numpy()
+            .reshape(-1)
+            .astype(np.float64)
+        )
+
+        conditional_surprise_raw = float("nan")
+        conditional_surprise_clipped = float("nan")
+        conditional_historical_count = 0.0
+        conditional_tables_used = 0
+
+        if (
+            self.state_action_familiarity.ready
+            and self.predictor_target_normalizer.ready
+        ):
+            (
+                conditional_surprise_raw,
+                conditional_surprise_clipped,
+                conditional_historical_count,
+                conditional_tables_used,
+            ) = self.conditional_outcome_tracker.observe(
+                state_action_np,
+                conditional_target_np,
+            )
+
+        # Relative familiarity is zero when the current pseudo-count is not
+        # above the regime-local mean count. It approaches one only when the
+        # current support is substantially larger than that mean. The existing
+        # gamma exponent then provides an additional suppression of merely
+        # moderate familiarity.
         if familiarity_ready:
             familiarity_weight = (
                 familiarity ** self.familiarity_gamma
@@ -1445,6 +2289,20 @@ class AVG:
         block_E_k = float("nan")
         W_for_log = self.change_score
 
+        conditional_z_for_log = float("nan")
+        conditional_run_length_for_log = (
+            self.conditional_exceedance_run
+        )
+        conditional_baseline_n_for_log = (
+            self.conditional_baseline_n
+        )
+        conditional_baseline_mean_for_log = (
+            self.conditional_baseline_mean
+        )
+        conditional_baseline_std_for_log = (
+            self._conditional_baseline_std()
+        )
+
         if self.warmup_remaining > 0:
             # Predictor and familiarity keep learning during warmup;
             # only detector accumulation is disabled.
@@ -1452,8 +2310,14 @@ class AVG:
 
             self.block_evidence_sum = 0.0
             self.block_weight_sum = 0.0
+            self.block_pseudo_count_sum = 0.0
+            self.block_count_reference_sum = 0.0
+            self.block_count_ratio_sum = 0.0
             self.block_familiarity_sum = 0.0
             self.block_surprise_sum = 0.0
+            self.block_conditional_surprise_sum = 0.0
+            self.block_conditional_support_sum = 0.0
+            self.block_conditional_valid_count = 0
             self.block_gradient_coherence_sum = 0.0
             self.block_gradient_novelty_sum = 0.0
             self.block_gradient_count = 0
@@ -1462,8 +2326,20 @@ class AVG:
         elif familiarity_ready:
             self.block_evidence_sum += e_t
             self.block_weight_sum += familiarity_weight
+            self.block_pseudo_count_sum += float(state_action_pseudo_count)
+            self.block_count_reference_sum += familiarity_count_mean
+            self.block_count_ratio_sum += familiarity_count_ratio
             self.block_familiarity_sum += familiarity
             self.block_surprise_sum += surprise_clipped
+
+            if np.isfinite(conditional_surprise_clipped):
+                self.block_conditional_surprise_sum += (
+                    conditional_surprise_clipped
+                )
+                self.block_conditional_support_sum += (
+                    conditional_historical_count
+                )
+                self.block_conditional_valid_count += 1
 
             if np.isfinite(gradient_coherence):
                 self.block_gradient_coherence_sum += gradient_coherence
@@ -1480,6 +2356,21 @@ class AVG:
                     / float(self.block_count)
                 )
 
+                mean_block_pseudo_count = (
+                    self.block_pseudo_count_sum
+                    / float(self.block_count)
+                )
+
+                mean_block_count_reference = (
+                    self.block_count_reference_sum
+                    / float(self.block_count)
+                )
+
+                mean_block_count_ratio = (
+                    self.block_count_ratio_sum
+                    / float(self.block_count)
+                )
+
                 mean_block_familiarity = (
                     self.block_familiarity_sum
                     / float(self.block_count)
@@ -1487,6 +2378,24 @@ class AVG:
 
                 mean_block_surprise = (
                     self.block_surprise_sum
+                    / float(self.block_count)
+                )
+
+                if self.block_conditional_valid_count > 0:
+                    mean_block_conditional_surprise = (
+                        self.block_conditional_surprise_sum
+                        / float(self.block_conditional_valid_count)
+                    )
+                    mean_block_conditional_support = (
+                        self.block_conditional_support_sum
+                        / float(self.block_conditional_valid_count)
+                    )
+                else:
+                    mean_block_conditional_surprise = float("nan")
+                    mean_block_conditional_support = 0.0
+
+                conditional_valid_fraction = (
+                    float(self.block_conditional_valid_count)
                     / float(self.block_count)
                 )
 
@@ -1531,7 +2440,31 @@ class AVG:
 
 
                 # -------------------------------------------------
-                # Surprise baseline + familiarity-gated CUSUM
+                # Local conditional-surprise decision
+                #
+                # This is the ACTUAL regime-change decision rule.
+                # The older NN-surprise CUSUM below is retained only as a
+                # diagnostic so existing E_k/W_k traces remain comparable.
+                # -------------------------------------------------
+
+                (
+                    conditional_z_for_log,
+                    conditional_run_length_for_log,
+                    conditional_baseline_n_for_log,
+                    conditional_baseline_mean_for_log,
+                    conditional_baseline_std_for_log,
+                    conditional_alarm,
+                ) = self._conditional_block_decision(
+                    mean_block_conditional_surprise,
+                    conditional_valid_fraction,
+                )
+
+                if conditional_alarm:
+                    regime_change = True
+
+                # -------------------------------------------------
+                # Legacy NN surprise baseline + CUSUM
+                # Diagnostic only: it no longer triggers an alarm.
                 # -------------------------------------------------
 
                 block_change_evidence = 0.0
@@ -1612,8 +2545,10 @@ class AVG:
 
                 W_for_log = self.change_score
 
-                if self.change_score > self.detector_h:
-                    regime_change = True
+                # NOTE:
+                # self.change_score / detector_h are now diagnostic only.
+                # regime_change is decided above from standardized local
+                # conditional surprise plus contiguous persistence.
 
                 with open(
                     self.detector_block_path,
@@ -1624,8 +2559,19 @@ class AVG:
                         f"{self.steps},"
                         f"{block_E_k:.8f},"
                         f"{self.change_score:.8f},"
+                        f"{mean_block_pseudo_count:.8f},"
+                        f"{mean_block_count_reference:.8f},"
+                        f"{mean_block_count_ratio:.8f},"
                         f"{mean_block_familiarity:.8f},"
                         f"{mean_block_surprise:.8f},"
+                        f"{mean_block_conditional_surprise:.8f},"
+                        f"{mean_block_conditional_support:.8f},"
+                        f"{conditional_valid_fraction:.8f},"
+                        f"{conditional_z_for_log:.8f},"
+                        f"{conditional_run_length_for_log},"
+                        f"{conditional_baseline_n_for_log},"
+                        f"{conditional_baseline_mean_for_log:.8f},"
+                        f"{conditional_baseline_std_for_log:.8f},"
                         f"{mean_block_gradient_coherence:.8f},"
                         f"{mean_block_gradient_novelty:.8f},"
                         f"{int(regime_change)}\n"
@@ -1634,8 +2580,14 @@ class AVG:
                 self.block_index += 1
                 self.block_evidence_sum = 0.0
                 self.block_weight_sum = 0.0
+                self.block_pseudo_count_sum = 0.0
+                self.block_count_reference_sum = 0.0
+                self.block_count_ratio_sum = 0.0
                 self.block_familiarity_sum = 0.0
                 self.block_surprise_sum = 0.0
+                self.block_conditional_surprise_sum = 0.0
+                self.block_conditional_support_sum = 0.0
+                self.block_conditional_valid_count = 0
                 self.block_gradient_coherence_sum = 0.0
                 self.block_gradient_novelty_sum = 0.0
                 self.block_gradient_count = 0
@@ -1654,6 +2606,18 @@ class AVG:
                             f"{mean_block_familiarity:.8f}, "
                             f"mean_surprise="
                             f"{mean_block_surprise:.8f}, "
+                            f"mean_conditional_surprise="
+                            f"{mean_block_conditional_surprise:.8f}, "
+                            f"conditional_valid_fraction="
+                            f"{conditional_valid_fraction:.8f}, "
+                            f"conditional_z="
+                            f"{conditional_z_for_log:.8f}, "
+                            f"conditional_run_length="
+                            f"{conditional_run_length_for_log}, "
+                            f"conditional_baseline_mean="
+                            f"{conditional_baseline_mean_for_log:.8f}, "
+                            f"conditional_baseline_std="
+                            f"{conditional_baseline_std_for_log:.8f}, "
                             f"mean_gradient_coherence="
                             f"{mean_block_gradient_coherence:.8f}, "
                             f"mean_gradient_novelty="
@@ -1670,6 +2634,7 @@ class AVG:
                     # Forget old-regime state-action visitation while keeping
                     # the fixed LSH projections and frozen normalization.
                     self.state_action_familiarity.reset_counts()
+                    self.conditional_outcome_tracker.reset()
 
                     # Count the alarm transition once as the first observed
                     # state-action input of the newly detected regime.
@@ -1679,8 +2644,17 @@ class AVG:
                             state_action_np
                         )
 
+                        if self.predictor_target_normalizer.ready:
+                            # Seed the new regime's historical conditional
+                            # anchor with this transition.  No score is used.
+                            self.conditional_outcome_tracker.observe(
+                                state_action_np,
+                                conditional_target_np,
+                            )
+
                     # Reset sequential detector state.
                     self.change_score = 0.0
+                    self._reset_conditional_decision_state()
 
                     # The old regime's nominal surprise level is no longer
                     # the appropriate reference.
@@ -1829,6 +2803,8 @@ class AVG:
                     f"{surprise_raw:.8f},"
                     f"{surprise_clipped:.8f},"
                     f"{state_action_pseudo_count},"
+                    f"{familiarity_count_mean:.8f},"
+                    f"{familiarity_count_ratio:.8f},"
                     f"{familiarity:.8f},"
                     f"{e_t:.8f},"
                     f"{block_E_k:.8f},"
@@ -1845,7 +2821,11 @@ class AVG:
                     f"{mean_epistemic_var_raw:.8f},"
                     f"{gradient_coherence:.8f},"
                     f"{gradient_novelty:.8f},"
-                    f"{predictor_nll:.8f}\n"
+                    f"{predictor_nll:.8f},"
+                    f"{conditional_surprise_raw:.8f},"
+                    f"{conditional_surprise_clipped:.8f},"
+                    f"{conditional_historical_count:.8f},"
+                    f"{conditional_tables_used}\n"
                 )
 
         # =================================================
@@ -1966,6 +2946,15 @@ class AVG:
             "gradient_coherence": gradient_coherence,
             "gradient_novelty": gradient_novelty,
             "predictor_nll": predictor_nll,
+            "conditional_surprise_raw": conditional_surprise_raw,
+            "conditional_surprise_clipped": conditional_surprise_clipped,
+            "conditional_historical_count": conditional_historical_count,
+            "conditional_tables_used": conditional_tables_used,
+            "conditional_z": conditional_z_for_log,
+            "conditional_run_length": conditional_run_length_for_log,
+            "conditional_baseline_n": conditional_baseline_n_for_log,
+            "conditional_baseline_mean": conditional_baseline_mean_for_log,
+            "conditional_baseline_std": conditional_baseline_std_for_log,
         }
 
 
@@ -1995,6 +2984,12 @@ class AVG:
             "detector": {
                 "change_score": self.change_score,
                 "warmup_remaining": self.warmup_remaining,
+                "conditional_baseline_n": self.conditional_baseline_n,
+                "conditional_baseline_mean": self.conditional_baseline_mean,
+                "conditional_baseline_M2": self.conditional_baseline_M2,
+                "conditional_exceedance_run": (
+                    self.conditional_exceedance_run
+                ),
                 "surprise_baseline": self.surprise_baseline,
                 "baseline_init_sum": self.baseline_init_sum,
                 "baseline_init_count": self.baseline_init_count,
@@ -2002,6 +2997,15 @@ class AVG:
                 "block_weight_sum": self.block_weight_sum,
                 "block_familiarity_sum": self.block_familiarity_sum,
                 "block_surprise_sum": self.block_surprise_sum,
+                "block_conditional_surprise_sum": (
+                    self.block_conditional_surprise_sum
+                ),
+                "block_conditional_support_sum": (
+                    self.block_conditional_support_sum
+                ),
+                "block_conditional_valid_count": (
+                    self.block_conditional_valid_count
+                ),
                 "block_gradient_coherence_sum": (
                     self.block_gradient_coherence_sum
                 ),
@@ -2024,6 +3028,9 @@ class AVG:
                 "block_index": self.block_index,
                 "state_action_familiarity": (
                     self.state_action_familiarity.state_dict()
+                ),
+                "conditional_outcome_tracker": (
+                    self.conditional_outcome_tracker.state_dict()
                 ),
             },
         }
@@ -2054,7 +3061,7 @@ def main(args):
         f"-{args.algo}"
         f"-{args.env}"
         f"_pred-{args.predictor_num_layers}x{args.nhid_predictor}"
-        f"_predreset-delta-norm"
+        f"_predreset-delta-norm-relcount-localbucket-zpersist"
         f"_seed-{args.seed}"
     )
 
@@ -2512,7 +3519,10 @@ if __name__ == "__main__":
         "--detector_h",
         default=1.3,
         type=float,
-        help="CUSUM alarm threshold applied to block-level W_k",
+        help=(
+            "Legacy NN-surprise CUSUM threshold retained for diagnostics; "
+            "it no longer triggers regime-change decisions"
+        ),
     )
 
     parser.add_argument(
@@ -2623,15 +3633,129 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--familiarity_count_scale",
-        default=10.0,
+        "--familiarity_relative_scale",
+        default=0.5,
         type=float,
+        help=(
+            "Lambda in relative familiarity: "
+            "F=1-exp(-((c/u-1)/lambda)^p) for c/u>1"
+        ),
+    )
+
+    parser.add_argument(
+        "--familiarity_relative_power",
+        default=2.0,
+        type=float,
+        help=(
+            "Shape exponent p in relative familiarity; larger values "
+            "make the knee around c/u=1 sharper"
+        ),
     )
 
     parser.add_argument(
         "--familiarity_input_clip",
         default=5.0,
         type=float,
+    )
+
+    # =====================================================
+    # Historical conditional outcome anchor
+    # =====================================================
+
+    parser.add_argument(
+        "--conditional_min_bucket_count",
+        default=20,
+        type=int,
+        help=(
+            "Local-model support threshold. Each bucket first trains its "
+            "affine RLS model for this many samples, then collects this many "
+            "pre-update residuals before it may emit conditional surprise"
+        ),
+    )
+
+    parser.add_argument(
+        "--conditional_min_tables",
+        default=2,
+        type=int,
+        help=(
+            "Minimum number of LSH tables with sufficient historical "
+            "outcome support required to emit a conditional score"
+        ),
+    )
+
+    parser.add_argument(
+        "--conditional_variance_floor",
+        default=1e-3,
+        type=float,
+        help=(
+            "Per-dimension variance floor for the historical conditional "
+            "outcome score in frozen normalized target coordinates"
+        ),
+    )
+
+    parser.add_argument(
+        "--conditional_surprise_cap",
+        default=20.0,
+        type=float,
+        help=(
+            "Clip local conditional surprise only for block averaging; "
+            "the raw transition score is also logged"
+        ),
+    )
+
+    parser.add_argument(
+        "--conditional_ridge",
+        default=1.0,
+        type=float,
+        help=(
+            "Ridge prior strength for each bucket-local recursive "
+            "least-squares affine model"
+        ),
+    )
+
+    # =====================================================
+    # Local conditional block decision
+    # =====================================================
+
+    parser.add_argument(
+        "--conditional_decision_init_blocks",
+        default=30,
+        type=int,
+        help=(
+            "Eligible local-conditional blocks used to initialize the "
+            "per-regime mean/std before change decisions begin"
+        ),
+    )
+
+    parser.add_argument(
+        "--conditional_decision_min_valid_fraction",
+        default=0.5,
+        type=float,
+        help=(
+            "Minimum fraction of transitions in a block with valid local "
+            "conditional scores before that block may affect the decision"
+        ),
+    )
+
+    parser.add_argument(
+        "--conditional_decision_z_threshold",
+        default=3.0,
+        type=float,
+        help=(
+            "One-sided standardized local-conditional block threshold. "
+            "Heuristic default; validate across seeds rather than treating "
+            "it as a calibrated false-alarm probability"
+        ),
+    )
+
+    parser.add_argument(
+        "--conditional_decision_persistence",
+        default=3,
+        type=int,
+        help=(
+            "Number of consecutive eligible blocks above the Z threshold "
+            "required to declare a regime change"
+        ),
     )
 
     # =====================================================
@@ -2669,6 +3793,30 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    if args.conditional_decision_init_blocks < 2:
+        raise ValueError(
+            "conditional_decision_init_blocks must be >= 2"
+        )
+
+    if not (
+        0.0
+        <= args.conditional_decision_min_valid_fraction
+        <= 1.0
+    ):
+        raise ValueError(
+            "conditional_decision_min_valid_fraction must be in [0, 1]"
+        )
+
+    if args.conditional_decision_z_threshold <= 0.0:
+        raise ValueError(
+            "conditional_decision_z_threshold must be > 0"
+        )
+
+    if args.conditional_decision_persistence < 1:
+        raise ValueError(
+            "conditional_decision_persistence must be >= 1"
+        )
 
     # Adam
     args.betas = [

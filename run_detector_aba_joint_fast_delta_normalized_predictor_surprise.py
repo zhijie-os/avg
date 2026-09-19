@@ -886,9 +886,10 @@ class AVG:
         self.baseline_freeze_score = cfg.baseline_freeze_score
 
         self.surprise_baseline = None
+        self.surprise_baseline_var = None
 
-        # Used only while constructing a new regime-local baseline.
         self.baseline_init_sum = 0.0
+        self.baseline_init_sum_sq = 0.0
         self.baseline_init_count = 0
 
         self.surprise_cap = cfg.surprise_cap
@@ -1547,19 +1548,24 @@ class AVG:
                         >= self.baseline_min_weight
                         and np.isfinite(weighted_surprise_mean)
                     ):
-                        self.baseline_init_sum += weighted_surprise_mean
+                        x = weighted_surprise_mean
+
+                        self.baseline_init_sum += x
+                        self.baseline_init_sum_sq += x * x
                         self.baseline_init_count += 1
 
-                        # Initialize the regime-local nominal surprise
-                        # only after enough eligible blocks have been seen.
-                        if (
-                            self.baseline_init_count
-                            >= self.baseline_init_blocks
-                        ):
-                            self.surprise_baseline = (
-                                self.baseline_init_sum
-                                / float(self.baseline_init_count)
-                            )
+                        if self.baseline_init_count >= self.baseline_init_blocks:
+                            n = self.baseline_init_count
+
+                            mu = self.baseline_init_sum / float(n)
+
+                            var = (
+                                self.baseline_init_sum_sq
+                                - float(n) * mu * mu
+                            ) / float(max(1, n - 1))
+
+                            self.surprise_baseline = mu
+                            self.surprise_baseline_var = max(var, 1e-6)
 
                     # Do not accumulate change evidence until
                     # a reliable baseline has been initialized.
@@ -1576,13 +1582,18 @@ class AVG:
                     #
                     # equivalently:
                     #   E_k - (mu_s + delta) * mean(w_t)
+                    baseline_std = np.sqrt(
+                        max(self.surprise_baseline_var, 1e-6)
+                    )
+
+                    z_k = (
+                        weighted_surprise_mean
+                        - self.surprise_baseline
+                    ) / baseline_std
+
                     block_change_evidence = (
-                        block_E_k
-                        - (
-                            self.surprise_baseline
-                            + self.baseline_margin
-                        )
-                        * mean_block_weight
+                        mean_block_weight
+                        * (z_k - self.baseline_margin)
                     )
 
                     # Standard one-sided CUSUM.

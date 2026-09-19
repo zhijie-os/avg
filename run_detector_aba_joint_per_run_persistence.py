@@ -251,11 +251,25 @@ class StateActionFamiliarityTracker:
 
     The first norm_warmup_steps inputs are used only to estimate a frozen
     mean/std. Thereafter, familiarity is queried BEFORE incrementing the
-    current buckets:
+    current buckets.
 
-        F_t = 1 - exp(-c_t / count_scale),
+    Let c_t be the median pseudo-count across independent tables and let u_t
+    be the running mean of previous regime-local pseudo-counts. Define
 
-    where c_t is the median pseudo-count across independent tables.
+        r_t = c_t / (u_t + eps).
+
+    Relative familiarity is
+
+        F_t = 0,                                      r_t <= 1
+        F_t = 1 - exp(-((r_t - 1) / lambda)^p),       r_t > 1
+
+    so merely being above the regime-average count is not enough to be
+    considered familiar. Only state-action regions with counts substantially
+    larger than the current regime-local mean approach F_t = 1.
+
+    The running count mean is updated only AFTER F_t is computed, preserving
+    score-before-update ordering. It is reset after each trusted alarm along
+    with the LSH counts.
     """
 
     def __init__(
@@ -267,7 +281,8 @@ class StateActionFamiliarityTracker:
         projections_per_table=4,
         num_buckets=4096,
         hash_width=1.0,
-        count_scale=10.0,
+        relative_scale=2.0,
+        relative_power=2.0,
         input_clip=5.0,
     ):
         self.dim = int(dim)
@@ -276,7 +291,8 @@ class StateActionFamiliarityTracker:
         self.projections_per_table = int(projections_per_table)
         self.num_buckets = int(num_buckets)
         self.hash_width = float(hash_width)
-        self.count_scale = float(count_scale)
+        self.relative_scale = float(relative_scale)
+        self.relative_power = float(relative_power)
         self.input_clip = float(input_clip)
 
         if self.dim <= 0:
@@ -289,8 +305,10 @@ class StateActionFamiliarityTracker:
             raise ValueError("Require familiarity_num_buckets >= 2")
         if self.hash_width <= 0.0:
             raise ValueError("Require familiarity_hash_width > 0")
-        if self.count_scale <= 0.0:
-            raise ValueError("Require familiarity_count_scale > 0")
+        if self.relative_scale <= 0.0:
+            raise ValueError("Require familiarity_relative_scale > 0")
+        if self.relative_power <= 0.0:
+            raise ValueError("Require familiarity_relative_power > 0")
         if self.input_clip <= 0.0:
             raise ValueError("Require familiarity_input_clip > 0")
 
@@ -335,6 +353,12 @@ class StateActionFamiliarityTracker:
         self.norm_M2 = np.zeros(self.dim, dtype=np.float64)
         self.frozen_mean = None
         self.frozen_std = None
+
+        # Regime-local running mean of queried pseudo-counts. This is used as
+        # the reference support level u_t for relative familiarity.
+        self.regime_count_n = 0
+        self.regime_count_mean = 0.0
+        self.relative_eps = 1e-8
 
     @property
     def ready(self):
@@ -409,7 +433,7 @@ class StateActionFamiliarityTracker:
 
         if not self.ready:
             self._update_normalizer(x)
-            return 0, 0.0, self.ready
+            return 0, 0.0, self.ready, 0.0, 0.0
 
         z = self._standardize(x)
         buckets = self._bucket_indices(z)
@@ -421,20 +445,51 @@ class StateActionFamiliarityTracker:
 
         pseudo_count = int(np.median(table_counts))
 
-        familiarity = float(
-            1.0
-            - np.exp(
-                -float(pseudo_count)
-                / self.count_scale
+        # Compare current support against the regime-local mean support from
+        # previous transitions. The current count must not influence its own
+        # familiarity score.
+        count_mean_before = float(self.regime_count_mean)
+
+        if self.regime_count_n == 0 or count_mean_before <= self.relative_eps:
+            count_ratio = 0.0
+            familiarity = 0.0
+        else:
+            count_ratio = (
+                float(pseudo_count)
+                / (count_mean_before + self.relative_eps)
             )
-        )
+
+            if count_ratio <= 1.0:
+                familiarity = 0.0
+            else:
+                scaled_excess = (
+                    (count_ratio - 1.0)
+                    / self.relative_scale
+                )
+                familiarity = float(
+                    1.0
+                    - np.exp(
+                        -(scaled_excess ** self.relative_power)
+                    )
+                )
+
+        # Update u_t only after scoring this transition.
+        self.regime_count_n += 1
+        count_delta = float(pseudo_count) - self.regime_count_mean
+        self.regime_count_mean += count_delta / float(self.regime_count_n)
 
         max_uint32 = np.iinfo(np.uint32).max
         for table_idx, bucket in enumerate(buckets):
             if self.counts[table_idx, bucket] < max_uint32:
                 self.counts[table_idx, bucket] += 1
 
-        return pseudo_count, familiarity, True
+        return (
+            pseudo_count,
+            familiarity,
+            True,
+            count_mean_before,
+            count_ratio,
+        )
 
     def reset_counts(self):
         """
@@ -442,6 +497,8 @@ class StateActionFamiliarityTracker:
         preserving the fixed LSH projections and frozen normalization.
         """
         self.counts.fill(0)
+        self.regime_count_n = 0
+        self.regime_count_mean = 0.0
 
     def state_dict(self):
         return {
@@ -451,6 +508,10 @@ class StateActionFamiliarityTracker:
             "frozen_mean": self.frozen_mean,
             "frozen_std": self.frozen_std,
             "counts": self.counts,
+            "regime_count_n": self.regime_count_n,
+            "regime_count_mean": self.regime_count_mean,
+            "relative_scale": self.relative_scale,
+            "relative_power": self.relative_power,
         }
 
 
@@ -721,7 +782,8 @@ class AVG:
         with open(self.detector_trace_path, "w") as f:
             f.write(
                 "step,surprise_raw,surprise_clipped,"
-                "state_action_pseudo_count,familiarity,e_t,"
+                "state_action_pseudo_count,familiarity_count_mean,"
+                "familiarity_count_ratio,familiarity,e_t,"
                 "block_E_k,W_k,block_completed,warmup_remaining,"
                 "regime_change,mean_total_var,mean_epistemic_var,"
                 "raw_residual_mse,raw_delta_state_mse,raw_reward_sq_error,"
@@ -732,7 +794,10 @@ class AVG:
         with open(self.detector_block_path, "w") as f:
             f.write(
                 "block_index,step,E_k,W_k,"
-                "mean_familiarity,mean_surprise,"
+                "mean_pseudo_count,mean_count_reference,mean_count_ratio,"
+                "mean_familiarity,mean_surprise,weighted_surprise,"
+                "baseline_mean,baseline_std,Z_k,"
+                "abnormal_block,eligible_block,"
                 "mean_gradient_coherence,mean_gradient_novelty,"
                 "regime_change\n"
             )
@@ -848,48 +913,50 @@ class AVG:
         self.predictor_reset_count = 0
 
         # -------------------------------------------------
-        # Simple surprise / familiarity block CUSUM
+        # Per-run standardized surprise + r-of-m persistence
         #
-        # Transition evidence:
-        #   s_t = mean_j (y_j - mu_j)^2 / var_j
-        #   e_t = clip(s_t, 0, s_max) * F_t^gamma
+        # Familiarity-weighted block surprise:
+        #   s_hat_k = sum_t w_t s_t / sum_t w_t,  w_t = F_t^gamma
         #
-        # Block evidence:
-        #   E_k = (1/B) sum_{t in block k} e_t
+        # Each run maintains its own regime-local nominal mean/variance:
+        #   Z_k = (s_hat_k - mu_s) / (sigma_s + eps)
+        #   A_k = 1[Z_k > tau]
         #
-        # Familiarity-gated surprise residual CUSUM:
-        #   G_k = (1/B) sum_t F_t^gamma * (s_t - mu_s - delta)
-        #   W_k = max(0, W_{k-1} + G_k)
-        #
-        # Predictors learn continuously within the currently detected
-        # regime.  On a trusted alarm, the complete predictor ensemble
-        # and predictor Adam states are reinitialized.  Low-familiarity
-        # inputs naturally suppress detector evidence while the fresh
-        # predictor learns the new regime.
+        # W_k is the number of abnormal trustworthy blocks among the
+        # most recent m trustworthy blocks.  Alarm when W_k >= r.
         # -------------------------------------------------
 
-        self.detector_h = cfg.detector_h
+        self.abnormal_z_threshold = cfg.abnormal_z_threshold
+        self.persistence_window = cfg.persistence_window
+        self.persistence_required = cfg.persistence_required
 
-        # -------------------------------------------------
-        # Nominal surprise baseline
-        #
-        # The baseline is regime-local:
-        #   1. After startup / a detected change, collect several
-        #      trustworthy blocks before initializing it.
-        #   2. Slowly update it while change evidence is small.
-        #   3. Freeze it once W becomes sufficiently suspicious.
-        # -------------------------------------------------
+        if self.abnormal_z_threshold <= 0.0:
+            raise ValueError("Require abnormal_z_threshold > 0")
+        if self.persistence_window < 1:
+            raise ValueError("Require persistence_window >= 1")
+        if (
+            self.persistence_required < 1
+            or self.persistence_required > self.persistence_window
+        ):
+            raise ValueError(
+                "Require 1 <= persistence_required <= persistence_window"
+            )
+
         self.baseline_alpha = cfg.baseline_alpha
-        self.baseline_margin = cfg.baseline_margin
         self.baseline_min_weight = cfg.baseline_min_weight
         self.baseline_init_blocks = cfg.baseline_init_blocks
-        self.baseline_freeze_score = cfg.baseline_freeze_score
 
         self.surprise_baseline = None
+        self.surprise_baseline_var = None
+        self.baseline_variance_eps = 1e-8
 
-        # Used only while constructing a new regime-local baseline.
-        self.baseline_init_sum = 0.0
+        # Welford state for regime-local baseline initialization.
+        self.baseline_init_mean = 0.0
+        self.baseline_init_M2 = 0.0
         self.baseline_init_count = 0
+
+        # Fixed-memory rolling indicators over trustworthy blocks.
+        self.abnormal_history = []
 
         self.surprise_cap = cfg.surprise_cap
         self.familiarity_gamma = cfg.familiarity_gamma
@@ -898,12 +965,17 @@ class AVG:
         self.initial_detector_warmup = cfg.initial_detector_warmup
         self.detector_log_interval = cfg.detector_log_interval
 
+        # For logging compatibility W_k/change_score is the current
+        # abnormal-block count inside the persistence window.
         self.change_score = 0.0
         self.warmup_remaining = self.initial_detector_warmup
 
         # Block statistics
         self.block_evidence_sum = 0.0       # sum w_t * s_t
         self.block_weight_sum = 0.0         # sum w_t
+        self.block_pseudo_count_sum = 0.0
+        self.block_count_reference_sum = 0.0
+        self.block_count_ratio_sum = 0.0
         self.block_familiarity_sum = 0.0
         self.block_surprise_sum = 0.0
         self.block_gradient_coherence_sum = 0.0
@@ -922,7 +994,8 @@ class AVG:
             ),
             num_buckets=cfg.familiarity_num_buckets,
             hash_width=cfg.familiarity_hash_width,
-            count_scale=cfg.familiarity_count_scale,
+            relative_scale=cfg.familiarity_relative_scale,
+            relative_power=cfg.familiarity_relative_power,
             input_clip=cfg.familiarity_input_clip,
         )
 
@@ -1414,13 +1487,17 @@ class AVG:
             state_action_pseudo_count,
             familiarity,
             familiarity_ready,
+            familiarity_count_mean,
+            familiarity_count_ratio,
         ) = self.state_action_familiarity.observe(
             state_action_np
         )
 
-        # Less-familiar inputs are strongly suppressed rather than
-        # creating change evidence. With gamma=4, for example,
-        # F=0.3 contributes only 0.3^4 = 0.0081 of its raw surprise.
+        # Relative familiarity is zero when the current pseudo-count is not
+        # above the regime-local mean count. It approaches one only when the
+        # current support is substantially larger than that mean. The existing
+        # gamma exponent then provides an additional suppression of merely
+        # moderate familiarity.
         if familiarity_ready:
             familiarity_weight = (
                 familiarity ** self.familiarity_gamma
@@ -1452,6 +1529,9 @@ class AVG:
 
             self.block_evidence_sum = 0.0
             self.block_weight_sum = 0.0
+            self.block_pseudo_count_sum = 0.0
+            self.block_count_reference_sum = 0.0
+            self.block_count_ratio_sum = 0.0
             self.block_familiarity_sum = 0.0
             self.block_surprise_sum = 0.0
             self.block_gradient_coherence_sum = 0.0
@@ -1462,6 +1542,9 @@ class AVG:
         elif familiarity_ready:
             self.block_evidence_sum += e_t
             self.block_weight_sum += familiarity_weight
+            self.block_pseudo_count_sum += float(state_action_pseudo_count)
+            self.block_count_reference_sum += familiarity_count_mean
+            self.block_count_ratio_sum += familiarity_count_ratio
             self.block_familiarity_sum += familiarity
             self.block_surprise_sum += surprise_clipped
 
@@ -1477,6 +1560,21 @@ class AVG:
 
                 block_E_k = (
                     self.block_evidence_sum
+                    / float(self.block_count)
+                )
+
+                mean_block_pseudo_count = (
+                    self.block_pseudo_count_sum
+                    / float(self.block_count)
+                )
+
+                mean_block_count_reference = (
+                    self.block_count_reference_sum
+                    / float(self.block_count)
+                )
+
+                mean_block_count_ratio = (
+                    self.block_count_ratio_sum
                     / float(self.block_count)
                 )
 
@@ -1531,14 +1629,21 @@ class AVG:
 
 
                 # -------------------------------------------------
-                # Surprise baseline + familiarity-gated CUSUM
+                # Per-run standardized surprise + persistence test
                 # -------------------------------------------------
 
-                block_change_evidence = 0.0
+                block_z = float("nan")
+                block_abnormal = 0
+                block_eligible = 0
+                baseline_mean_for_log = (
+                    float("nan")
+                    if self.surprise_baseline is None
+                    else float(self.surprise_baseline)
+                )
+                baseline_std_for_log = float("nan")
 
                 # =================================================
-                # A. No baseline yet:
-                #    collect several trustworthy blocks first.
+                # A. Build regime-local nominal mean/variance.
                 # =================================================
                 if self.surprise_baseline is None:
 
@@ -1547,73 +1652,153 @@ class AVG:
                         >= self.baseline_min_weight
                         and np.isfinite(weighted_surprise_mean)
                     ):
-                        self.baseline_init_sum += weighted_surprise_mean
                         self.baseline_init_count += 1
 
-                        # Initialize the regime-local nominal surprise
-                        # only after enough eligible blocks have been seen.
+                        delta_init = (
+                            weighted_surprise_mean
+                            - self.baseline_init_mean
+                        )
+                        self.baseline_init_mean += (
+                            delta_init
+                            / float(self.baseline_init_count)
+                        )
+                        delta2_init = (
+                            weighted_surprise_mean
+                            - self.baseline_init_mean
+                        )
+                        self.baseline_init_M2 += (
+                            delta_init * delta2_init
+                        )
+
                         if (
                             self.baseline_init_count
                             >= self.baseline_init_blocks
                         ):
-                            self.surprise_baseline = (
-                                self.baseline_init_sum
-                                / float(self.baseline_init_count)
+                            self.surprise_baseline = float(
+                                self.baseline_init_mean
                             )
 
-                    # Do not accumulate change evidence until
-                    # a reliable baseline has been initialized.
+                            if self.baseline_init_count > 1:
+                                init_var = (
+                                    self.baseline_init_M2
+                                    / float(self.baseline_init_count - 1)
+                                )
+                            else:
+                                init_var = self.baseline_variance_eps
+
+                            self.surprise_baseline_var = max(
+                                float(init_var),
+                                self.baseline_variance_eps,
+                            )
+
+                            baseline_mean_for_log = float(
+                                self.surprise_baseline
+                            )
+                            baseline_std_for_log = float(
+                                np.sqrt(self.surprise_baseline_var)
+                            )
+
+                    self.abnormal_history = []
                     self.change_score = 0.0
 
                 # =================================================
-                # B. Baseline exists:
-                #    compute familiarity-gated excess surprise.
+                # B. Standardize trustworthy blocks and apply r-of-m.
                 # =================================================
                 else:
-
-                    # G_k =
-                    #   (1/B) sum_t w_t [s_t - mu_s - delta]
-                    #
-                    # equivalently:
-                    #   E_k - (mu_s + delta) * mean(w_t)
-                    block_change_evidence = (
-                        block_E_k
-                        - (
-                            self.surprise_baseline
-                            + self.baseline_margin
+                    baseline_mean_for_log = float(
+                        self.surprise_baseline
+                    )
+                    baseline_std_for_log = float(
+                        np.sqrt(
+                            max(
+                                self.surprise_baseline_var,
+                                self.baseline_variance_eps,
+                            )
                         )
-                        * mean_block_weight
                     )
 
-                    # Standard one-sided CUSUM.
-                    self.change_score = max(
-                        0.0,
-                        self.change_score
-                        + block_change_evidence,
-                    )
-
-                    # Slowly track ordinary within-regime changes in
-                    # predictive difficulty while W is still small.
-                    # Once W becomes meaningfully positive, freeze the
-                    # baseline so it cannot learn away a true regime change.
                     if (
-                        self.change_score
-                        < self.baseline_freeze_score
-                        and mean_block_weight
+                        mean_block_weight
                         >= self.baseline_min_weight
                         and np.isfinite(weighted_surprise_mean)
                     ):
-                        self.surprise_baseline = (
-                            (1.0 - self.baseline_alpha)
-                            * self.surprise_baseline
-                            + self.baseline_alpha
-                            * weighted_surprise_mean
+                        block_eligible = 1
+
+                        # Score using PRE-UPDATE nominal statistics.
+                        block_z = (
+                            weighted_surprise_mean
+                            - self.surprise_baseline
+                        ) / (
+                            baseline_std_for_log
+                            + 1e-8
+                        )
+
+                        block_abnormal = int(
+                            block_z > self.abnormal_z_threshold
+                        )
+
+                        self.abnormal_history.append(block_abnormal)
+                        if (
+                            len(self.abnormal_history)
+                            > self.persistence_window
+                        ):
+                            self.abnormal_history.pop(0)
+
+                        self.change_score = float(
+                            sum(self.abnormal_history)
+                        )
+
+                        # Only clearly nominal trustworthy blocks update
+                        # the nominal distribution.  An abnormal block
+                        # cannot teach the baseline away from a change.
+                        if not block_abnormal:
+                            old_mean = float(
+                                self.surprise_baseline
+                            )
+                            old_var = float(
+                                self.surprise_baseline_var
+                            )
+                            delta = (
+                                weighted_surprise_mean
+                                - old_mean
+                            )
+                            new_mean = (
+                                old_mean
+                                + self.baseline_alpha * delta
+                            )
+                            new_var = (
+                                (1.0 - self.baseline_alpha)
+                                * old_var
+                                + self.baseline_alpha
+                                * delta
+                                * (
+                                    weighted_surprise_mean
+                                    - new_mean
+                                )
+                            )
+
+                            self.surprise_baseline = float(new_mean)
+                            self.surprise_baseline_var = max(
+                                float(new_var),
+                                self.baseline_variance_eps,
+                            )
+
+                        if (
+                            len(self.abnormal_history)
+                            >= self.persistence_required
+                            and self.change_score
+                            >= self.persistence_required
+                        ):
+                            regime_change = True
+
+                    # Ineligible blocks neither enter the persistence
+                    # window nor move the nominal baseline.
+                    else:
+                        self.change_score = float(
+                            sum(self.abnormal_history)
                         )
 
                 W_for_log = self.change_score
-
-                if self.change_score > self.detector_h:
-                    regime_change = True
 
                 with open(
                     self.detector_block_path,
@@ -1624,8 +1809,17 @@ class AVG:
                         f"{self.steps},"
                         f"{block_E_k:.8f},"
                         f"{self.change_score:.8f},"
+                        f"{mean_block_pseudo_count:.8f},"
+                        f"{mean_block_count_reference:.8f},"
+                        f"{mean_block_count_ratio:.8f},"
                         f"{mean_block_familiarity:.8f},"
                         f"{mean_block_surprise:.8f},"
+                        f"{weighted_surprise_mean:.8f},"
+                        f"{baseline_mean_for_log:.8f},"
+                        f"{baseline_std_for_log:.8f},"
+                        f"{block_z:.8f},"
+                        f"{block_abnormal},"
+                        f"{block_eligible},"
                         f"{mean_block_gradient_coherence:.8f},"
                         f"{mean_block_gradient_novelty:.8f},"
                         f"{int(regime_change)}\n"
@@ -1634,6 +1828,9 @@ class AVG:
                 self.block_index += 1
                 self.block_evidence_sum = 0.0
                 self.block_weight_sum = 0.0
+                self.block_pseudo_count_sum = 0.0
+                self.block_count_reference_sum = 0.0
+                self.block_count_ratio_sum = 0.0
                 self.block_familiarity_sum = 0.0
                 self.block_surprise_sum = 0.0
                 self.block_gradient_coherence_sum = 0.0
@@ -1650,6 +1847,15 @@ class AVG:
                             f"step={self.steps}, "
                             f"E_k={block_E_k:.8f}, "
                             f"W_k={self.change_score:.8f}, "
+                            f"weighted_surprise="
+                            f"{weighted_surprise_mean:.8f}, "
+                            f"baseline="
+                            f"{baseline_mean_for_log:.8f}, "
+                            f"baseline_std="
+                            f"{baseline_std_for_log:.8f}, "
+                            f"Z_k={block_z:.8f}, "
+                            f"abnormal_count="
+                            f"{int(self.change_score)}, "
                             f"mean_familiarity="
                             f"{mean_block_familiarity:.8f}, "
                             f"mean_surprise="
@@ -1679,15 +1885,18 @@ class AVG:
                             state_action_np
                         )
 
-                    # Reset sequential detector state.
+                    # Reset standardized persistence state.
                     self.change_score = 0.0
+                    self.abnormal_history = []
 
-                    # The old regime's nominal surprise level is no longer
-                    # the appropriate reference.
+                    # The old regime's nominal surprise distribution is no
+                    # longer the appropriate reference.
                     self.surprise_baseline = None
+                    self.surprise_baseline_var = None
 
-                    # Restart multi-block baseline initialization.
-                    self.baseline_init_sum = 0.0
+                    # Restart Welford baseline initialization.
+                    self.baseline_init_mean = 0.0
+                    self.baseline_init_M2 = 0.0
                     self.baseline_init_count = 0
 
                     # No fixed post-change warmup.  Immediately continue
@@ -1829,6 +2038,8 @@ class AVG:
                     f"{surprise_raw:.8f},"
                     f"{surprise_clipped:.8f},"
                     f"{state_action_pseudo_count},"
+                    f"{familiarity_count_mean:.8f},"
+                    f"{familiarity_count_ratio:.8f},"
                     f"{familiarity:.8f},"
                     f"{e_t:.8f},"
                     f"{block_E_k:.8f},"
@@ -1994,9 +2205,12 @@ class AVG:
 
             "detector": {
                 "change_score": self.change_score,
+                "abnormal_history": list(self.abnormal_history),
                 "warmup_remaining": self.warmup_remaining,
                 "surprise_baseline": self.surprise_baseline,
-                "baseline_init_sum": self.baseline_init_sum,
+                "surprise_baseline_var": self.surprise_baseline_var,
+                "baseline_init_mean": self.baseline_init_mean,
+                "baseline_init_M2": self.baseline_init_M2,
                 "baseline_init_count": self.baseline_init_count,
                 "block_evidence_sum": self.block_evidence_sum,
                 "block_weight_sum": self.block_weight_sum,
@@ -2054,7 +2268,7 @@ def main(args):
         f"-{args.algo}"
         f"-{args.env}"
         f"_pred-{args.predictor_num_layers}x{args.nhid_predictor}"
-        f"_predreset-delta-norm"
+        f"_predreset-delta-norm-relcount"
         f"_seed-{args.seed}"
     )
 
@@ -2509,24 +2723,41 @@ if __name__ == "__main__":
     # =====================================================
 
     parser.add_argument(
-        "--detector_h",
-        default=1.3,
+        "--abnormal_z_threshold",
+        default=2.0,
         type=float,
-        help="CUSUM alarm threshold applied to block-level W_k",
+        help=(
+            "A trustworthy block is abnormal when its familiarity-weighted "
+            "surprise is this many regime-local standard deviations above "
+            "the current nominal mean"
+        ),
+    )
+
+    parser.add_argument(
+        "--persistence_window",
+        default=5,
+        type=int,
+        help="Number of recent trustworthy blocks in the persistence window",
+    )
+
+    parser.add_argument(
+        "--persistence_required",
+        default=3,
+        type=int,
+        help=(
+            "Declare a regime change when at least this many blocks in the "
+            "persistence window are abnormal"
+        ),
     )
 
     parser.add_argument(
         "--baseline_alpha",
         default=0.01,
         type=float,
-        help="EMA rate for the stable-regime block evidence baseline",
-    )
-
-    parser.add_argument(
-        "--baseline_margin",
-        default=0.10,
-        type=float,
-        help="Required excess above nominal block evidence before CUSUM grows",
+        help=(
+            "EMA rate for regime-local surprise mean/variance on clearly "
+            "nominal trustworthy blocks"
+        ),
     )
 
     parser.add_argument(
@@ -2543,16 +2774,6 @@ if __name__ == "__main__":
         help=(
             "Number of eligible blocks used to initialize "
             "the regime-local surprise baseline"
-        ),
-    )
-
-    parser.add_argument(
-        "--baseline_freeze_score",
-        default=0.5,
-        type=float,
-        help=(
-            "Freeze surprise-baseline adaptation once "
-            "CUSUM W_k reaches this level"
         ),
     )
 
@@ -2581,7 +2802,7 @@ if __name__ == "__main__":
         "--initial_detector_warmup",
         default=10_000,
         type=int,
-        help="Initial steps with predictor learning but no CUSUM accumulation",
+        help="Initial steps with predictor learning but no change decisions",
     )
 
     parser.add_argument(
@@ -2623,9 +2844,23 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--familiarity_count_scale",
-        default=10.0,
+        "--familiarity_relative_scale",
+        default=0.5,
         type=float,
+        help=(
+            "Lambda in relative familiarity: "
+            "F=1-exp(-((c/u-1)/lambda)^p) for c/u>1"
+        ),
+    )
+
+    parser.add_argument(
+        "--familiarity_relative_power",
+        default=2.0,
+        type=float,
+        help=(
+            "Shape exponent p in relative familiarity; larger values "
+            "make the knee around c/u=1 sharper"
+        ),
     )
 
     parser.add_argument(

@@ -251,11 +251,25 @@ class StateActionFamiliarityTracker:
 
     The first norm_warmup_steps inputs are used only to estimate a frozen
     mean/std. Thereafter, familiarity is queried BEFORE incrementing the
-    current buckets:
+    current buckets.
 
-        F_t = 1 - exp(-c_t / count_scale),
+    Let c_t be the median pseudo-count across independent tables and let u_t
+    be the running mean of previous regime-local pseudo-counts. Define
 
-    where c_t is the median pseudo-count across independent tables.
+        r_t = c_t / (u_t + eps).
+
+    Relative familiarity is
+
+        F_t = 0,                                      r_t <= 1
+        F_t = 1 - exp(-((r_t - 1) / lambda)^p),       r_t > 1
+
+    so merely being above the regime-average count is not enough to be
+    considered familiar. Only state-action regions with counts substantially
+    larger than the current regime-local mean approach F_t = 1.
+
+    The running count mean is updated only AFTER F_t is computed, preserving
+    score-before-update ordering. It is reset after each trusted alarm along
+    with the LSH counts.
     """
 
     def __init__(
@@ -267,7 +281,8 @@ class StateActionFamiliarityTracker:
         projections_per_table=4,
         num_buckets=4096,
         hash_width=1.0,
-        count_scale=10.0,
+        relative_scale=2.0,
+        relative_power=2.0,
         input_clip=5.0,
     ):
         self.dim = int(dim)
@@ -276,7 +291,8 @@ class StateActionFamiliarityTracker:
         self.projections_per_table = int(projections_per_table)
         self.num_buckets = int(num_buckets)
         self.hash_width = float(hash_width)
-        self.count_scale = float(count_scale)
+        self.relative_scale = float(relative_scale)
+        self.relative_power = float(relative_power)
         self.input_clip = float(input_clip)
 
         if self.dim <= 0:
@@ -289,8 +305,10 @@ class StateActionFamiliarityTracker:
             raise ValueError("Require familiarity_num_buckets >= 2")
         if self.hash_width <= 0.0:
             raise ValueError("Require familiarity_hash_width > 0")
-        if self.count_scale <= 0.0:
-            raise ValueError("Require familiarity_count_scale > 0")
+        if self.relative_scale <= 0.0:
+            raise ValueError("Require familiarity_relative_scale > 0")
+        if self.relative_power <= 0.0:
+            raise ValueError("Require familiarity_relative_power > 0")
         if self.input_clip <= 0.0:
             raise ValueError("Require familiarity_input_clip > 0")
 
@@ -335,6 +353,12 @@ class StateActionFamiliarityTracker:
         self.norm_M2 = np.zeros(self.dim, dtype=np.float64)
         self.frozen_mean = None
         self.frozen_std = None
+
+        # Regime-local running mean of queried pseudo-counts. This is used as
+        # the reference support level u_t for relative familiarity.
+        self.regime_count_n = 0
+        self.regime_count_mean = 0.0
+        self.relative_eps = 1e-8
 
     @property
     def ready(self):
@@ -409,7 +433,7 @@ class StateActionFamiliarityTracker:
 
         if not self.ready:
             self._update_normalizer(x)
-            return 0, 0.0, self.ready
+            return 0, 0.0, self.ready, 0.0, 0.0
 
         z = self._standardize(x)
         buckets = self._bucket_indices(z)
@@ -421,20 +445,51 @@ class StateActionFamiliarityTracker:
 
         pseudo_count = int(np.median(table_counts))
 
-        familiarity = float(
-            1.0
-            - np.exp(
-                -float(pseudo_count)
-                / self.count_scale
+        # Compare current support against the regime-local mean support from
+        # previous transitions. The current count must not influence its own
+        # familiarity score.
+        count_mean_before = float(self.regime_count_mean)
+
+        if self.regime_count_n == 0 or count_mean_before <= self.relative_eps:
+            count_ratio = 0.0
+            familiarity = 0.0
+        else:
+            count_ratio = (
+                float(pseudo_count)
+                / (count_mean_before + self.relative_eps)
             )
-        )
+
+            if count_ratio <= 1.0:
+                familiarity = 0.0
+            else:
+                scaled_excess = (
+                    (count_ratio - 1.0)
+                    / self.relative_scale
+                )
+                familiarity = float(
+                    1.0
+                    - np.exp(
+                        -(scaled_excess ** self.relative_power)
+                    )
+                )
+
+        # Update u_t only after scoring this transition.
+        self.regime_count_n += 1
+        count_delta = float(pseudo_count) - self.regime_count_mean
+        self.regime_count_mean += count_delta / float(self.regime_count_n)
 
         max_uint32 = np.iinfo(np.uint32).max
         for table_idx, bucket in enumerate(buckets):
             if self.counts[table_idx, bucket] < max_uint32:
                 self.counts[table_idx, bucket] += 1
 
-        return pseudo_count, familiarity, True
+        return (
+            pseudo_count,
+            familiarity,
+            True,
+            count_mean_before,
+            count_ratio,
+        )
 
     def reset_counts(self):
         """
@@ -442,6 +497,8 @@ class StateActionFamiliarityTracker:
         preserving the fixed LSH projections and frozen normalization.
         """
         self.counts.fill(0)
+        self.regime_count_n = 0
+        self.regime_count_mean = 0.0
 
     def state_dict(self):
         return {
@@ -451,6 +508,10 @@ class StateActionFamiliarityTracker:
             "frozen_mean": self.frozen_mean,
             "frozen_std": self.frozen_std,
             "counts": self.counts,
+            "regime_count_n": self.regime_count_n,
+            "regime_count_mean": self.regime_count_mean,
+            "relative_scale": self.relative_scale,
+            "relative_power": self.relative_power,
         }
 
 
@@ -721,7 +782,8 @@ class AVG:
         with open(self.detector_trace_path, "w") as f:
             f.write(
                 "step,surprise_raw,surprise_clipped,"
-                "state_action_pseudo_count,familiarity,e_t,"
+                "state_action_pseudo_count,familiarity_count_mean,"
+                "familiarity_count_ratio,familiarity,e_t,"
                 "block_E_k,W_k,block_completed,warmup_remaining,"
                 "regime_change,mean_total_var,mean_epistemic_var,"
                 "raw_residual_mse,raw_delta_state_mse,raw_reward_sq_error,"
@@ -732,6 +794,7 @@ class AVG:
         with open(self.detector_block_path, "w") as f:
             f.write(
                 "block_index,step,E_k,W_k,"
+                "mean_pseudo_count,mean_count_reference,mean_count_ratio,"
                 "mean_familiarity,mean_surprise,"
                 "mean_gradient_coherence,mean_gradient_novelty,"
                 "regime_change\n"
@@ -904,6 +967,9 @@ class AVG:
         # Block statistics
         self.block_evidence_sum = 0.0       # sum w_t * s_t
         self.block_weight_sum = 0.0         # sum w_t
+        self.block_pseudo_count_sum = 0.0
+        self.block_count_reference_sum = 0.0
+        self.block_count_ratio_sum = 0.0
         self.block_familiarity_sum = 0.0
         self.block_surprise_sum = 0.0
         self.block_gradient_coherence_sum = 0.0
@@ -922,7 +988,8 @@ class AVG:
             ),
             num_buckets=cfg.familiarity_num_buckets,
             hash_width=cfg.familiarity_hash_width,
-            count_scale=cfg.familiarity_count_scale,
+            relative_scale=cfg.familiarity_relative_scale,
+            relative_power=cfg.familiarity_relative_power,
             input_clip=cfg.familiarity_input_clip,
         )
 
@@ -1414,13 +1481,17 @@ class AVG:
             state_action_pseudo_count,
             familiarity,
             familiarity_ready,
+            familiarity_count_mean,
+            familiarity_count_ratio,
         ) = self.state_action_familiarity.observe(
             state_action_np
         )
 
-        # Less-familiar inputs are strongly suppressed rather than
-        # creating change evidence. With gamma=4, for example,
-        # F=0.3 contributes only 0.3^4 = 0.0081 of its raw surprise.
+        # Relative familiarity is zero when the current pseudo-count is not
+        # above the regime-local mean count. It approaches one only when the
+        # current support is substantially larger than that mean. The existing
+        # gamma exponent then provides an additional suppression of merely
+        # moderate familiarity.
         if familiarity_ready:
             familiarity_weight = (
                 familiarity ** self.familiarity_gamma
@@ -1452,6 +1523,9 @@ class AVG:
 
             self.block_evidence_sum = 0.0
             self.block_weight_sum = 0.0
+            self.block_pseudo_count_sum = 0.0
+            self.block_count_reference_sum = 0.0
+            self.block_count_ratio_sum = 0.0
             self.block_familiarity_sum = 0.0
             self.block_surprise_sum = 0.0
             self.block_gradient_coherence_sum = 0.0
@@ -1462,6 +1536,9 @@ class AVG:
         elif familiarity_ready:
             self.block_evidence_sum += e_t
             self.block_weight_sum += familiarity_weight
+            self.block_pseudo_count_sum += float(state_action_pseudo_count)
+            self.block_count_reference_sum += familiarity_count_mean
+            self.block_count_ratio_sum += familiarity_count_ratio
             self.block_familiarity_sum += familiarity
             self.block_surprise_sum += surprise_clipped
 
@@ -1477,6 +1554,21 @@ class AVG:
 
                 block_E_k = (
                     self.block_evidence_sum
+                    / float(self.block_count)
+                )
+
+                mean_block_pseudo_count = (
+                    self.block_pseudo_count_sum
+                    / float(self.block_count)
+                )
+
+                mean_block_count_reference = (
+                    self.block_count_reference_sum
+                    / float(self.block_count)
+                )
+
+                mean_block_count_ratio = (
+                    self.block_count_ratio_sum
                     / float(self.block_count)
                 )
 
@@ -1624,6 +1716,9 @@ class AVG:
                         f"{self.steps},"
                         f"{block_E_k:.8f},"
                         f"{self.change_score:.8f},"
+                        f"{mean_block_pseudo_count:.8f},"
+                        f"{mean_block_count_reference:.8f},"
+                        f"{mean_block_count_ratio:.8f},"
                         f"{mean_block_familiarity:.8f},"
                         f"{mean_block_surprise:.8f},"
                         f"{mean_block_gradient_coherence:.8f},"
@@ -1634,6 +1729,9 @@ class AVG:
                 self.block_index += 1
                 self.block_evidence_sum = 0.0
                 self.block_weight_sum = 0.0
+                self.block_pseudo_count_sum = 0.0
+                self.block_count_reference_sum = 0.0
+                self.block_count_ratio_sum = 0.0
                 self.block_familiarity_sum = 0.0
                 self.block_surprise_sum = 0.0
                 self.block_gradient_coherence_sum = 0.0
@@ -1829,6 +1927,8 @@ class AVG:
                     f"{surprise_raw:.8f},"
                     f"{surprise_clipped:.8f},"
                     f"{state_action_pseudo_count},"
+                    f"{familiarity_count_mean:.8f},"
+                    f"{familiarity_count_ratio:.8f},"
                     f"{familiarity:.8f},"
                     f"{e_t:.8f},"
                     f"{block_E_k:.8f},"
@@ -2054,7 +2154,7 @@ def main(args):
         f"-{args.algo}"
         f"-{args.env}"
         f"_pred-{args.predictor_num_layers}x{args.nhid_predictor}"
-        f"_predreset-delta-norm"
+        f"_predreset-delta-norm-relcount"
         f"_seed-{args.seed}"
     )
 
@@ -2623,9 +2723,23 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--familiarity_count_scale",
-        default=10.0,
+        "--familiarity_relative_scale",
+        default=0.5,
         type=float,
+        help=(
+            "Lambda in relative familiarity: "
+            "F=1-exp(-((c/u-1)/lambda)^p) for c/u>1"
+        ),
+    )
+
+    parser.add_argument(
+        "--familiarity_relative_power",
+        default=2.0,
+        type=float,
+        help=(
+            "Shape exponent p in relative familiarity; larger values "
+            "make the knee around c/u=1 sharper"
+        ),
     )
 
     parser.add_argument(

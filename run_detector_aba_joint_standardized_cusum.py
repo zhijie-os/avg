@@ -734,7 +734,9 @@ class AVG:
                 "block_index,step,E_k,W_k,"
                 "mean_familiarity,mean_surprise,"
                 "mean_gradient_coherence,mean_gradient_novelty,"
-                "regime_change\n"
+                "regime_change,weighted_surprise_mean,"
+                "surprise_baseline,surprise_baseline_std,z_k,"
+                "block_change_evidence\n"
             )
 
         # -------------------------------------------------
@@ -857,9 +859,15 @@ class AVG:
         # Block evidence:
         #   E_k = (1/B) sum_{t in block k} e_t
         #
-        # Familiarity-gated surprise residual CUSUM:
-        #   G_k = (1/B) sum_t F_t^gamma * (s_t - mu_s - delta)
+        # Familiarity-gated standardized surprise CUSUM:
+        #   s_hat_k = sum_t w_t s_t / sum_t w_t
+        #   z_k = (s_hat_k - mu_s) / sigma_s
+        #   G_k = mean(w_t) * (z_k - kappa)
         #   W_k = max(0, W_{k-1} + G_k)
+        #
+        # The regime-local baseline tracks both mean and variance so the
+        # detector accumulates evidence in approximately standardized units
+        # rather than raw surprise units.
         #
         # Predictors learn continuously within the currently detected
         # regime.  On a trusted alarm, the complete predictor ensemble
@@ -886,9 +894,11 @@ class AVG:
         self.baseline_freeze_score = cfg.baseline_freeze_score
 
         self.surprise_baseline = None
+        self.surprise_baseline_var = None
 
         # Used only while constructing a new regime-local baseline.
         self.baseline_init_sum = 0.0
+        self.baseline_init_sum_sq = 0.0
         self.baseline_init_count = 0
 
         self.surprise_cap = cfg.surprise_cap
@@ -1535,6 +1545,13 @@ class AVG:
                 # -------------------------------------------------
 
                 block_change_evidence = 0.0
+                z_k = float("nan")
+                baseline_std_for_log = float("nan")
+                baseline_mean_for_log = (
+                    float("nan")
+                    if self.surprise_baseline is None
+                    else float(self.surprise_baseline)
+                )
 
                 # =================================================
                 # A. No baseline yet:
@@ -1547,18 +1564,33 @@ class AVG:
                         >= self.baseline_min_weight
                         and np.isfinite(weighted_surprise_mean)
                     ):
-                        self.baseline_init_sum += weighted_surprise_mean
+                        x = weighted_surprise_mean
+                        self.baseline_init_sum += x
+                        self.baseline_init_sum_sq += x * x
                         self.baseline_init_count += 1
 
-                        # Initialize the regime-local nominal surprise
-                        # only after enough eligible blocks have been seen.
+                        # Initialize the regime-local nominal mean and
+                        # variance only after enough eligible blocks have
+                        # been seen.  The sample variance sets the scale for
+                        # the standardized detector statistic.
                         if (
                             self.baseline_init_count
                             >= self.baseline_init_blocks
                         ):
-                            self.surprise_baseline = (
+                            n = self.baseline_init_count
+                            mu = (
                                 self.baseline_init_sum
-                                / float(self.baseline_init_count)
+                                / float(n)
+                            )
+                            var = (
+                                self.baseline_init_sum_sq
+                                - float(n) * mu * mu
+                            ) / float(max(1, n - 1))
+
+                            self.surprise_baseline = mu
+                            self.surprise_baseline_var = max(
+                                var,
+                                1e-6,
                             )
 
                     # Do not accumulate change evidence until
@@ -1571,31 +1603,43 @@ class AVG:
                 # =================================================
                 else:
 
-                    # G_k =
-                    #   (1/B) sum_t w_t [s_t - mu_s - delta]
+                    # Standardize the familiarity-weighted block surprise
+                    # by the current regime's nominal variability:
                     #
-                    # equivalently:
-                    #   E_k - (mu_s + delta) * mean(w_t)
+                    #   z_k = (s_hat_k - mu_s) / sigma_s
+                    #   G_k = mean(w_t) * (z_k - kappa)
+                    #
+                    # baseline_margin now plays the role of the standardized
+                    # CUSUM reference value kappa.
+                    baseline_std = np.sqrt(
+                        max(self.surprise_baseline_var, 1e-6)
+                    )
+                    baseline_std_for_log = float(baseline_std)
+                    baseline_mean_for_log = float(self.surprise_baseline)
+
+                    z_k = (
+                        weighted_surprise_mean
+                        - self.surprise_baseline
+                    ) / baseline_std
+
+                    z_k_clipped = min(z_k, 3.0)
+
                     block_change_evidence = (
-                        block_E_k
-                        - (
-                            self.surprise_baseline
-                            + self.baseline_margin
-                        )
-                        * mean_block_weight
+                        mean_block_weight
+                        * (z_k_clipped - self.baseline_margin)
                     )
 
-                    # Standard one-sided CUSUM.
+                    # Standard one-sided CUSUM in standardized units.
                     self.change_score = max(
                         0.0,
                         self.change_score
                         + block_change_evidence,
                     )
 
-                    # Slowly track ordinary within-regime changes in
-                    # predictive difficulty while W is still small.
-                    # Once W becomes meaningfully positive, freeze the
-                    # baseline so it cannot learn away a true regime change.
+                    # Slowly track ordinary within-regime changes in both
+                    # nominal mean and nominal variance while W is still
+                    # small.  Once W becomes meaningfully positive, freeze
+                    # both so a true change cannot normalize itself away.
                     if (
                         self.change_score
                         < self.baseline_freeze_score
@@ -1603,11 +1647,21 @@ class AVG:
                         >= self.baseline_min_weight
                         and np.isfinite(weighted_surprise_mean)
                     ):
+                        x = weighted_surprise_mean
+                        alpha = self.baseline_alpha
+                        diff = x - self.surprise_baseline
+
                         self.surprise_baseline = (
-                            (1.0 - self.baseline_alpha)
+                            (1.0 - alpha)
                             * self.surprise_baseline
-                            + self.baseline_alpha
-                            * weighted_surprise_mean
+                            + alpha * x
+                        )
+
+                        self.surprise_baseline_var = max(
+                            (1.0 - alpha)
+                            * self.surprise_baseline_var
+                            + alpha * diff * diff,
+                            1e-6,
                         )
 
                 W_for_log = self.change_score
@@ -1628,7 +1682,12 @@ class AVG:
                         f"{mean_block_surprise:.8f},"
                         f"{mean_block_gradient_coherence:.8f},"
                         f"{mean_block_gradient_novelty:.8f},"
-                        f"{int(regime_change)}\n"
+                        f"{int(regime_change)},"
+                        f"{weighted_surprise_mean:.8f},"
+                        f"{baseline_mean_for_log:.8f},"
+                        f"{baseline_std_for_log:.8f},"
+                        f"{z_k:.8f},"
+                        f"{block_change_evidence:.8f}\n"
                     )
 
                 self.block_index += 1
@@ -1685,9 +1744,11 @@ class AVG:
                     # The old regime's nominal surprise level is no longer
                     # the appropriate reference.
                     self.surprise_baseline = None
+                    self.surprise_baseline_var = None
 
                     # Restart multi-block baseline initialization.
                     self.baseline_init_sum = 0.0
+                    self.baseline_init_sum_sq = 0.0
                     self.baseline_init_count = 0
 
                     # No fixed post-change warmup.  Immediately continue
@@ -1996,7 +2057,9 @@ class AVG:
                 "change_score": self.change_score,
                 "warmup_remaining": self.warmup_remaining,
                 "surprise_baseline": self.surprise_baseline,
+                "surprise_baseline_var": self.surprise_baseline_var,
                 "baseline_init_sum": self.baseline_init_sum,
+                "baseline_init_sum_sq": self.baseline_init_sum_sq,
                 "baseline_init_count": self.baseline_init_count,
                 "block_evidence_sum": self.block_evidence_sum,
                 "block_weight_sum": self.block_weight_sum,
@@ -2054,7 +2117,7 @@ def main(args):
         f"-{args.algo}"
         f"-{args.env}"
         f"_pred-{args.predictor_num_layers}x{args.nhid_predictor}"
-        f"_predreset-delta-norm"
+        f"_predreset-delta-norm-zcusum"
         f"_seed-{args.seed}"
     )
 
@@ -2510,9 +2573,11 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--detector_h",
-        default=1.3,
+        default=5.0,
         type=float,
-        help="CUSUM alarm threshold applied to block-level W_k",
+        help=(
+            "CUSUM alarm threshold applied to standardized block-level W_k"
+        ),
     )
 
     parser.add_argument(
@@ -2524,9 +2589,11 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--baseline_margin",
-        default=0.10,
+        default=0.5,
         type=float,
-        help="Required excess above nominal block evidence before CUSUM grows",
+        help=(
+            "Standardized CUSUM reference value kappa subtracted from z_k"
+        ),
     )
 
     parser.add_argument(
@@ -2548,11 +2615,11 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--baseline_freeze_score",
-        default=0.5,
+        default=4,
         type=float,
         help=(
-            "Freeze surprise-baseline adaptation once "
-            "CUSUM W_k reaches this level"
+            "Freeze surprise-baseline mean/variance adaptation once "
+            "standardized CUSUM W_k reaches this level"
         ),
     )
 
