@@ -1,0 +1,4 @@
+step,surprise_raw,surprise_clipped,state_action_pseudo_count,familiarity,e_t,local_conditional_surprise,local_matched,local_valid_tables,block_E_k,W_k,block_completed,warmup_remaining,regime_change,mean_total_var,mean_epistemic_var,raw_residual_mse,raw_delta_state_mse,raw_reward_sq_error,mean_total_var_raw,mean_epistemic_var_raw,gradient_coherence,gradient_novelty,predictor_nll
+0,4.85265923,4.85265923,0,0.00000000,0.00000000,nan,0,0,nan,0.00000000,0,9999,0,1.00020576,0.00052505,4.87688684,5.15840912,0.09101643,1.00020576,0.00052505,nan,nan,60.14443715
+100,1.32712328,1.32712328,0,0.00000000,0.00000000,nan,0,0,nan,0.00000000,0,9899,0,1.01383114,0.00405557,30.28139496,32.06154633,0.01882732,38.47999191,0.15911874,-0.08500230,1.08500230,28.53786278
+200,0.71831584,0.71831584,0,0.00000000,0.00000000,nan,0,0,nan,0.00000000,0,9799,0,0.99651748,0.00362684,34.75585175,36.78067398,0.33385983,34.24690628,0.08450774,0.19049732,0.80950268,22.93687566
